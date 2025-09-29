@@ -71,7 +71,7 @@ GO
 IF object_id('[dbo].[sp_employeeStatusList]') IS NULL
 	EXEC ('CREATE PROCEDURE [dbo].[sp_employeeStatusList] as select 1')
 GO
-
+ 
 ALTER PROCEDURE [dbo].[sp_employeeStatusList] (@LanguageID VARCHAR(2) = 'VN', @EmployeeStatusID INT = 0)
 AS
 BEGIN
