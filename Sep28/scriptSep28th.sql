@@ -4687,3 +4687,3056 @@ END
 	--exec sp_foreignSalarySummary 3,7,2025
 GO
 
+
+if object_id('[dbo].[sp_AttendanceSummaryMonthly_STD]') is null
+	EXEC ('CREATE PROCEDURE [dbo].[sp_AttendanceSummaryMonthly_STD] as select 1')
+GO
+ALTER PROCEDURE [dbo].[sp_AttendanceSummaryMonthly_STD] (@Month INT, @Year INT, @LoginID INT = 3, @LanguageID VARCHAR(2) = 'VN', @OptionView INT = 1, @isExport INT = 0, @ViewProbationPeriod BIT = 0)
+AS
+BEGIN
+	DECLARE @FromDate DATE, @ToDate DATE
+
+	SELECT @FromDate = FromDate, @ToDate = ToDate
+	FROM dbo.fn_Get_SalaryPeriod(@Month, @Year)
+
+	DECLARE @GetDate DATETIME = dbo.Truncate_Date(GetDate())
+
+	SELECT EmployeeID, FullName, DivisionID, DepartmentID, SectionID, HireDate, PositionID, TerminateDate, EmployeeTypeID, GroupID
+	INTO #fn_vtblEmployeeList_Bydate
+	FROM dbo.fn_vtblEmployeeList_Simple_ByDate(@ToDate, '-1', @LoginID) e
+	WHERE (ISNULL(@OptionView, '-1') = '-1' OR ISNULL(@OptionView, 0) = 0 OR (ISNULL(@OptionView, 1) = 1 AND IsForeign = 0) OR (ISNULL(@OptionView, '-1') = 2 AND ISNULL(IsForeign, 1) = 1))
+
+	SELECT ROW_NUMBER() OVER (
+			ORDER BY ORD, LeaveCode
+			) AS ORD, LeaveCode, TACode
+	INTO #LeaveCode
+	FROM tblLeaveType
+	WHERE IsVisible = 1
+
+	SELECT ROW_NUMBER() OVER (
+			ORDER BY e.EmployeeID
+			) AS [No], e.EmployeeID, FullName, p.PositionName, d.DivisionName, dept.DepartmentName, s.SectionName, g.GroupName, HireDate, TerminateDate
+	INTO #tmpEmployeeList
+	FROM #fn_vtblEmployeeList_Bydate e
+	LEFT JOIN tblSection s ON s.SectionID = e.SectionID
+	LEFT JOIN tblPosition p ON p.PositionID = e.PositionID
+	LEFT JOIN tblDivision d ON d.DivisionID = e.DivisionID
+	LEFT JOIN tblDepartment dept ON dept.DepartmentID = e.DepartmentID
+	LEFT JOIN tblGroup g ON g.GroupID = e.GroupID
+
+	SELECT h.EmployeeID, h.AttDate, h.AttStart, h.AttEnd
+	INTO #tblHasTA
+	FROM tblHasTA h
+	INNER JOIN #tmpEmployeeList elb ON elb.EmployeeID = h.EmployeeID
+	WHERE AttDate BETWEEN @FromDate AND @ToDate
+
+	SELECT ot.EmployeeID, ot.OTDate, ot.ApprovedHours, ot.OTKind, ots.ColumnDisplayName OTType
+	INTO #tblOTList
+	FROM tblOTList ot
+	INNER JOIN #tmpEmployeeList elb ON elb.EmployeeID = ot.EmployeeID
+	LEFT JOIN tblOvertimeSetting ots ON ots.OTKind = ot.OTKind
+	WHERE ot.OTDate BETWEEN @FromDate AND @ToDate AND ot.Approved = 1 AND ApprovedHours <> 0
+
+	-- ko nằm trong danh sách thì ko tính lương nha
+	CREATE TABLE #Tadata (EmployeeID VARCHAR(20), Attdate DATE, HireDate DATE, EmployeeStatusID INT, HolidayStatus INT, WorkingTime FLOAT(53), Std_Hour_PerDays FLOAT(53), Lvamount FLOAT(53), PaidAmount_Des FLOAT(53), UnpaidAmount_Des FLOAT(53), SalaryHistoryID INT, CutSI BIT, LeaveCode VARCHAR(5), EmployeeTypeID INT)
+
+	EXEC sp_WorkingTimeProvider @Month = @Month, @Year = @Year, @fromdate = @FromDate, @todate = @ToDate, @loginId = @LoginID
+
+	EXEC sp_processSummaryAttendance @LoginID = @LoginID, @Year = @Year, @Month = @Month, @ViewType = 0, @Payroll = 1
+
+	SELECT *
+	INTO #tblAttendanceSummary
+	FROM tblAttendanceSummary
+	WHERE 1 = 0
+
+	-- Tạo danh sách các cột cần tính tổng động
+	DECLARE @cols NVARCHAR(MAX) = '', @querySelector NVARCHAR(MAX) = ''
+
+	IF (@ViewProbationPeriod <> 1)
+	BEGIN
+		SELECT @cols += N',SUM(' + QUOTENAME(COLUMN_NAME) + N') AS ' + QUOTENAME(COLUMN_NAME), @querySelector += N',' + QUOTENAME(COLUMN_NAME)
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_NAME = 'tblAttendanceSummary' AND COLUMN_NAME NOT IN ('Month', 'Year', 'EmployeeID', 'PeriodID', 'FromDate', 'ToDate');
+	END
+	ELSE
+	BEGIN
+		SELECT @cols += N',' + QUOTENAME(COLUMN_NAME) + N' AS ' + QUOTENAME(COLUMN_NAME), @querySelector += N',' + QUOTENAME(COLUMN_NAME)
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_NAME = 'tblAttendanceSummary' AND COLUMN_NAME NOT IN ('Month', 'Year', 'EmployeeID', 'PeriodID', 'FromDate', 'ToDate');
+	END
+
+	-- Tạo truy vấn động
+	DECLARE @sql NVARCHAR(MAX) = N'
+        INSERT INTO #tblAttendanceSummary (EmployeeID, Month, Year, PeriodID, FromDate, ToDate ' + @querySelector + N')
+        SELECT
+            EmployeeID,
+            @Month AS Month,
+            @Year AS Year,
+			ISNULL(PeriodID, 0), FromDate, ToDate
+            ' + @cols + N'
+        FROM tblAttendanceSummary
+        WHERE Month = @Month AND Year = @Year AND EmployeeID IN (
+            SELECT EmployeeID FROM #tmpEmployeeList
+        )
+        GROUP BY EmployeeID, Month, Year, PeriodID, FromDate, ToDate
+    ';
+
+	-- Thực thi truy vấn động
+	EXEC sp_executesql @sql, N'@Month INT, @Year INT', @Month = @Month, @Year = @Year;
+
+	SELECT n.EmployeeID, SUM(HourApprove) NSHours, elb.FromDate, elb.ToDate
+	INTO #NightShiftSum
+	FROM tblNightShiftList n
+	INNER JOIN #tblAttendanceSummary elb ON elb.EmployeeID = n.EmployeeID AND n.DATE BETWEEN elb.FromDate AND elb.ToDate
+	WHERE n.DATE BETWEEN @FromDate AND @ToDate
+	GROUP BY n.EmployeeID, elb.FromDate, elb.ToDate
+
+	SELECT o.EmployeeID, SUM(ApprovedHours) AS ApprovedHours, OTKind, OTType, FromDate, ToDate
+	INTO #tblOTSummary
+	FROM #tblOTList o
+	INNER JOIN #tblAttendanceSummary el ON el.EmployeeID = O.EmployeeID AND O.OTDate BETWEEN el.FromDate AND el.ToDate
+	GROUP BY o.EmployeeID, OTKind, OTType, FromDate, ToDate
+
+	SELECT e.EmployeeID, ROUND(SUM(IOMinutesDeduct) / 60, 1) AS IOHrs, el.FromDate, el.ToDate
+	INTO #InLateOutEarly
+	FROM tblInLateOutEarly e
+	INNER JOIN #tblAttendanceSummary el ON el.EmployeeID = e.EmployeeID AND e.IODate BETWEEN el.FromDate AND el.ToDate
+	WHERE ApprovedDeduct = 1 AND IODate BETWEEN @FromDate AND @ToDate
+	GROUP BY e.EmployeeID, el.FromDate, el.ToDate
+
+	--Dữ liệu custom
+	SELECT *
+	INTO #tblCustomAttendanceData
+	FROM tblCustomAttendanceData
+	WHERE Month = @Month AND Year = @Year AND EmployeeID IN (
+			SELECT EmployeeID
+			FROM #tmpEmployeeList
+			)
+
+	DECLARE @CustomOTInsert NVARCHAR(MAX) = ''
+
+	SELECT @CustomOTInsert += '
+	insert into #tblOTSummary(EmployeeID,OTKind,ApprovedHours)
+	select EmployeeID,''' + CAST(OTKind AS VARCHAR(10)) + ''',' + ColumnNameOn_CustomAttendanceTable + '
+	from #tblCustomAttendanceData where ' + ColumnNameOn_CustomAttendanceTable + ' <>0'
+	FROM tblOvertimeSetting ov
+	WHERE ov.ColumnNameOn_CustomAttendanceTable IN (
+			SELECT COLUMN_NAME
+			FROM INFORMATION_SCHEMA.COLUMNS c
+			WHERE c.TABLE_NAME = 'tblCustomAttendanceData'
+			)
+
+	EXEC (@CustomOTInsert)
+
+	UPDATE s
+	SET OTType = ov.ColumnDisplayName
+	FROM #tblOTSummary s
+	INNER JOIN tblOvertimeSetting ov ON ov.OTKind = s.OTKind
+	WHERE OTType IS NULL
+
+	-- --Thông tin nghỉ
+	SELECT h.EmployeeID, h.LeaveCode, LeaveDate, LvAmount, LeaveStatus, lc.TACode
+	INTO #LeaveHistory
+	FROM tblLvHistory h
+	INNER JOIN #tmpEmployeeList e ON e.EmployeeID = h.EmployeeID
+	LEFT JOIN #LeaveCode lc ON lc.LeaveCode = h.LeaveCode
+	WHERE LeaveDate BETWEEN @FromDate AND @ToDate
+
+	CREATE TABLE #SummaryData (
+		--Hay dùng từ pivot lắm mà k bao giờ chịu pivot con ngta
+		STT INT, EmployeeID VARCHAR(20), FullName NVARCHAR(MAX), DepartmentName NVARCHAR(MAX), PositionName NVARCHAR(MAX), HireDate DATE, ProbationEndDate DATE, STD_WorkingDays FLOAT, Actual_WorkingDays FLOAT,
+		TotalPaidDays FLOAT, WorkHours FLOAT, PaidLeaveHrs FLOAT, UnpaidLeave FLOAT, IOHrs DECIMAL(10, 1), TotalOT DECIMAL(10, 2), TotalNS DECIMAL(10, 2), TotalDayOff DECIMAL(10, 2)
+		)
+
+	INSERT INTO #SummaryData (STT, EmployeeID, FullName, HireDate, DepartmentName, PositionName)
+	SELECT No, EmployeeID, FullName, HireDate, DepartmentName, PositionName
+	FROM #tmpEmployeeList
+
+	DECLARE @Query NVARCHAR(MAX) = 'ALTER TABLE #SummaryData ADD '
+
+	SELECT @Query += ISNULL(TACode, '') + ' DECIMAL(10, 1), '
+	FROM #LeaveCode
+	ORDER BY ORD ASC
+
+	SELECT @Query += ISNULL(ColumnDisplayName, '') + ' DECIMAL(10, 1),'
+	FROM tblOvertimeSetting
+	ORDER BY ColumnDisplayName ASC
+
+	IF (ISNULL(@isExport, 0) = 0)
+	BEGIN
+		SELECT @Query += N'[' + CAST(Number AS VARCHAR(3)) + 'Att] VARCHAR(30), '
+		FROM dbo.fn_Numberlist(CAST(DAY(@FromDate) AS INT), CAST(DAY(@ToDate) AS INT))
+	END
+
+	SET @Query = @Query + ' ForgetTimekeeper INT, Signture NVARCHAR(10), Notes NVARCHAR(200)'
+
+	EXEC sp_executesql @Query
+
+	ALTER TABLE #Tadata ADD WorkingTimeDisplay VARCHAR(100)
+
+	UPDATE #Tadata
+	SET WorkingTimeDisplay = CASE
+			WHEN ISNULL(LeaveCode, '') <> ''
+				THEN LeaveCode
+			WHEN AttStart IS NOT NULL OR AttEnd IS NOT NULL AND ISNULL(LeaveCode, '') = ''
+				THEN ISNULL(CONVERT(VARCHAR(5), AttStart, 8), '--:--') + ' | ' + ISNULL(CONVERT(VARCHAR(5), AttEnd, 8), '--:--')
+			ELSE NULL
+			END
+	FROM #Tadata
+	LEFT JOIN #tblHasTA t ON t.EmployeeID = #Tadata.EmployeeID AND t.Attdate = #Tadata.Attdate
+
+	IF (ISNULL(@isExport, 0) = 0)
+	BEGIN
+		SET @Query = ''
+
+		SELECT @Query = (
+			SELECT 'UPDATE s SET [' + CAST(Number AS VARCHAR(3)) + 'Att] = w.WorkingTimeDisplay'
+				+ ' FROM #SummaryData s'
+				+ ' INNER JOIN #Tadata w ON s.EmployeeID = w.EmployeeID'
+				+ ' WHERE DAY(w.Attdate) = ' + CAST(Number AS VARCHAR(3)) + ';'
+				+ CHAR(13) + CHAR(10)
+			FROM dbo.fn_Numberlist(CAST(DAY(@FromDate) AS INT), CAST(DAY(@ToDate) AS INT))
+			FOR XML PATH(''), TYPE
+		).value('.', 'NVARCHAR(MAX)')
+
+		EXEC sp_executesql @Query
+	END
+
+	SET @Query = ''
+
+	SELECT @Query += N'UPDATE s SET [' + ISNULL(TACode, '') + '] = w.' + ISNULL(TACode, '') + '
+                        FROM #SummaryData s
+                        INNER JOIN #tblAttendanceSummary w ON s.EmployeeID = w.EmployeeID;'
+	FROM #LeaveCode
+
+	EXEC sp_executesql @Query
+
+	SET @Query = ''
+
+	SELECT @Query += N'UPDATE s SET [' + ISNULL(ColumnDisplayName, '') + '] = w.ApprovedHours
+                        FROM #SummaryData s
+                        INNER JOIN #tblOTSummary w ON s.EmployeeID = w.EmployeeID
+						WHERE w.OTType = ''' + ISNULL(ColumnDisplayName, '') + N''';'
+	FROM tblOvertimeSetting
+
+	EXEC sp_executesql @Query
+
+	UPDATE s
+	SET WorkHours = CAST(a.WorkingHrs_Total AS decimal(10, 2)), PaidLeaveHrs = a.PaidLeaveHrs_Total, UnpaidLeave = a.UnpaidLeaveDays * a.Std_Hour_PerDays, STD_WorkingDays = a.RegularWorkdays, Actual_WorkingDays = CAST(ROUND((a.WorkingHrs_Total / a.Std_Hour_PerDays), 2) AS decimal(10, 2)), TotalPaidDays = CAST(a.WorkingDays_Total AS decimal(10, 2))
+	FROM #SummaryData s
+	INNER JOIN #tblAttendanceSummary a ON a.EmployeeID = s.EmployeeID
+
+	UPDATE s
+	SET TotalNS = ISNULL(a.NSHours, 0)
+	FROM #SummaryData s
+	INNER JOIN #NightShiftSum a ON a.EmployeeID = s.EmployeeID
+
+	UPDATE s
+	SET IOHrs = ISNULL(a.IOHrs, 0)
+	FROM #SummaryData s
+	INNER JOIN #InLateOutEarly a ON a.EmployeeID = s.EmployeeID
+
+	UPDATE s
+	SET TotalOT = ISNULL(a.SumOTHours, 0)
+	FROM #SummaryData s
+	INNER JOIN (
+		SELECT EmployeeID, SUM(ApprovedHours) SumOTHours
+		FROM #tblOTSummary
+		GROUP BY EmployeeID
+		) a ON a.EmployeeID = s.EmployeeID
+
+	SELECT EmployeeID, SaturdayDate AS SatDate
+	INTO #SatWorkList
+	FROM dbo.fn_GetEmployeeSatWork(@LoginID, @Month, @Year)
+	--WHERE SaturdayDate BETWEEN @FromDate AND @ToDate
+	
+	UNION
+	
+	SELECT EmployeeID, SaturdayDate_2nd AS SatDate
+	FROM dbo.fn_GetEmployeeSatWork(@LoginID, @Month, @Year)
+
+	UPDATE s
+	SET TotalDayOff = ISNULL(a.DayOff, 0)
+	FROM #SummaryData s
+	INNER JOIN (
+		SELECT EmployeeID, COUNT(1) DayOff
+		FROM #SatWorkList
+		GROUP BY EmployeeID
+		) a ON a.EmployeeID = s.EmployeeID
+
+	--Ẩn các cột k có dữ liệu
+	SELECT l.ORD, l.TACode, c.ColumnExcel
+	INTO #HideColumn
+	FROM #LeaveCode l
+	INNER JOIN dbo.fn_ColumnExcel('G', 'Y') c ON c.ORD = l.ORD
+	ORDER BY l.ORD ASC;
+
+	WITH OTKind_CTE
+	AS (
+		SELECT ROW_NUMBER() OVER (
+				ORDER BY ColumnDisplayName
+				) AS ORD, ColumnDisplayName, OTKind
+		FROM tblOvertimeSetting h
+		)
+	SELECT CTE.ORD, OTKind, c.ColumnExcel, ColumnDisplayName
+	INTO #HideColumn_OT
+	FROM OTKind_CTE CTE
+	INNER JOIN dbo.fn_ColumnExcel('Z', 'AG') c ON c.ORD = CTE.ORD
+
+	DELETE
+	FROM #HideColumn
+	WHERE TACode IN (
+			SELECT DISTINCT TACode
+			FROM #LeaveHistory
+			) OR TACode IN ('P', 'AWP', 'S', 'O', 'M', 'SP')
+
+	DELETE
+	FROM #HideColumn_OT
+	WHERE OTKind IN (
+			SELECT DISTINCT OTKind
+			FROM #tblOTSummary
+			WHERE ISNULL(OTKind, '') <> ''
+			)
+
+
+	-- SET @Query = 'ALTER TABLE #SummaryData DROP COLUMN'
+	-- SELECT @Query += N'[' + ISNULL(TACode, '') + N'],'
+	-- FROM #HideColumn
+	-- SELECT @Query += N'[' + ISNULL(ColumnDisplayName, '') + N'],'
+	-- FROM #HideColumn_OT
+	-- SELECT @Query = ISNULL(@Query, '') + ' Notes'
+	-- EXEC sp_executesql @Query
+	DECLARE @HideColumn NVARCHAR(MAX) = ''
+
+	IF (ISNULL(@isExport, 0) = 1)
+	BEGIN
+
+		CREATE TABLE #ExportConfig (ORD INT identity PRIMARY KEY, TableIndex VARCHAR(max), RowIndex INT, ColumnName NVARCHAR(200), ParseType NVARCHAR(max), Position NVARCHAR(200), SheetIndex INT, TestDescription NVARCHAR(max), WithHeader INT, WithBestFit BIT, ColumnList_formatCell VARCHAR(200), formatCell VARCHAR(200))
+
+		SET @Query = 'SELECT '
+
+		SELECT @Query += N'''' + ISNULL(TACode, '') + N''' AS [' + ISNULL(TACode, '') + N'],'
+		FROM #LeaveCode
+		ORDER BY ORD ASC
+
+		SET @Query += '''In Late/Out Early'''
+
+		EXEC sp_executesql @Query
+
+		SELECT @HideColumn += N'' + ISNULL(TACode, '') + N','
+		FROM #HideColumn
+
+		SELECT @HideColumn += N'' + ISNULL(ColumnDisplayName, '') + N','
+		FROM #HideColumn_OT
+
+		-- IF EXISTS (
+		-- 		SELECT 1
+		-- 		FROM #HideColumn
+		-- 		) OR EXISTS (
+		-- 		SELECT 1
+		-- 		FROM #HideColumn_OT
+		-- 		)
+		-- BEGIN
+		-- 	INSERT INTO #ExportConfig (ParseType, Position, SheetIndex)
+		-- 	SELECT 'DeleteColumn', ColumnExcel, 0
+		-- 	FROM #HideColumn
+		-- 	UNION
+		-- 	SELECT 'DeleteColumn', ColumnExcel, 0
+		-- 	FROM #HideColumn_OT
+		--     ORDER BY ColumnExcel desc
+		-- END
+		INSERT INTO #ExportConfig (TableIndex, ParseType, Position, SheetIndex, WithHeader)
+		VALUES (0, 'Table_NonInsert', 'G6', 0, 0)
+
+		ALTER TABLE #SummaryData
+
+		DROP COLUMN WorkHours, PaidLeaveHrs, UnpaidLeave
+
+		SELECT *
+		FROM #SummaryData
+
+		SELECT N'From/Từ:  ' + CONVERT(NVARCHAR(10), @FromDate, 103) + N'                                    To/Đến: ' + CONVERT(NVARCHAR(10), @ToDate, 103)
+
+		SELECT ColumnDisplayName + ': ' + DescriptionEN
+		FROM tblOvertimeSetting
+		ORDER BY ColumnDisplayName ASC
+
+		SELECT TACode + ': ' + DescriptionEN
+		FROM tblLeaveType
+		WHERE IsVisible = 1
+		ORDER BY ORD
+
+		INSERT INTO #ExportConfig (TableIndex, ParseType, Position, SheetIndex, WithHeader)
+		VALUES (3, 'Table_NonInsert', 'B11', 0, 0)
+
+		INSERT INTO #ExportConfig (TableIndex, ParseType, Position, SheetIndex, WithHeader)
+		VALUES (4, 'Table_NonInsert', 'F11', 0, 0)
+
+		INSERT INTO #ExportConfig (TableIndex, ParseType, Position, SheetIndex, WithHeader)
+		VALUES (1, 'Table|HideColumn=' + @HideColumn, 'B7', 0, 0)
+
+		INSERT INTO #ExportConfig (TableIndex, ParseType, Position, SheetIndex, WithHeader)
+		VALUES (2, 'Table_NonInsert', 'G3', 0, 0)
+
+		SELECT *
+		FROM #ExportConfig
+		ORDER BY ORD
+
+		RETURN
+	END
+
+	IF (ISNULL(@isExport, 0) = 0)
+	BEGIN
+		SET @Query = 'ALTER TABLE #SummaryData DROP COLUMN '
+
+		SELECT @Query += N'' + ISNULL(TACode, '') + N','
+		FROM #LeaveCode
+		WHERE TACode NOT IN (
+				SELECT DISTINCT TACode
+				FROM #LeaveHistory
+				)
+
+		SELECT @Query += N'' + ISNULL(ColumnDisplayName, '') + N','
+		FROM #HideColumn_OT
+
+		SELECT @Query = ISNULL(@Query, '') + ' Notes'
+
+		EXEC sp_executesql @Query
+	END
+
+	SELECT *
+	FROM #SummaryData
+	ORDER BY EmployeeID
+END
+GO
+
+
+
+if object_id('[dbo].[sp_processSummaryAttendance]') is null
+	EXEC ('CREATE PROCEDURE [dbo].[sp_processSummaryAttendance] as select 1')
+GO
+
+ALTER PROCEDURE [dbo].[sp_processSummaryAttendance] (@LoginID INT, @Year INT, @Month INT, @ViewType INT = 0, @Payroll BIT = 0)
+AS
+BEGIN
+	--    ALTER TABLE tblOvertimeSetting ALTER COLUMN ColumnDisplayName NVARCHAR(100) NOT NULL
+	--View Type: 0: 0 view chỉ process, 1: view summary, 2: view in-out chi tiết
+	DECLARE @FromDate DATE, @ToDate DATE
+
+	SELECT @FromDate = FromDate, @ToDate = ToDate
+	FROM dbo.fn_Get_SalaryPeriod(@Month, @Year)
+
+	--LeaveType
+	DECLARE @Query NVARCHAR(MAX) = ''
+
+	-- SELECT @Query = (
+	-- 	SELECT N'IF COL_LENGTH(''tblAttendanceSummary'',''' + LeaveCode + N''') is null
+	-- 					ALTER TABLE tblAttendanceSummary ADD [' + LeaveCode + N'] FLOAT;'
+	-- 	FROM tblLeaveType
+	-- 	WHERE IsVisible = 1
+	-- 	FOR XML PATH(''), TYPE
+	-- ).value('.', 'NVARCHAR(MAX)')
+
+	-- EXEC (@Query)
+
+	SELECT *
+	INTO #tblAttendanceSummary
+	FROM tblAttendanceSummary
+	WHERE 1=0
+
+	--, CAST(NULL AS DATETIME) TerminateDate, CAST(NULL AS DATETIME) HireDate, CAST(NULL AS DATETIME) ProbationEndDate, CAST(NULL AS INT) isForeign
+	SELECT te.EmployeeID, te.DivisionID, te.DepartmentID, te.SectionID, te.GroupID, te.EmployeeTypeID, te.PositionID, te.EmployeeStatusID, te.Sex, CASE
+			WHEN te.HireDate > @fromDate
+				THEN cast(1 AS BIT)
+			ELSE 0
+			END AS NewStaff, CAST(0 AS BIT) AS TerminatedStaff, HireDate, CAST(NULL AS DATETIME) TerminateDate, ProbationEndDate, te.LastWorkingDate, CAST(0 AS BIT) hasTwoPeriods, et.isLocalStaff, te.isForeign, et.PercentProbation
+	INTO #EmployeeList
+	FROM dbo.fn_vtblEmployeeList_Simple_ByDate(@ToDate, '-1', @LoginID) te
+	INNER JOIN tblEmployeeType et ON te.EmployeeTypeID = et.EmployeeTypeID
+
+	DELETE e
+	FROM #EmployeeList e
+	INNER JOIN tblAtt_LockMonth l ON e.EmployeeID = l.EmployeeID AND l.Month = @Month AND l.Year = @Year
+
+	DELETE e
+	FROM #EmployeeList e
+	INNER JOIN tblSal_Lock l ON e.EmployeeID = l.EmployeeID AND l.Month = @Month AND l.Year = @Year
+
+	--INNER JOIN tblAtt_LockMonth a ON a.EmployeeID = e.EmployeeID AND a.Month = @Month AND a.Year = @Year
+	-- khoa roi thi khong tinh luong nua
+	SELECT *
+	INTO #fn_EmployeeStatus_ByDate
+	FROM dbo.fn_EmployeeStatus_ByDate(@ToDate)
+
+	SELECT *
+	INTO #fn_EmployeeStatus_ByDate_FirstLastMonth
+	FROM dbo.fn_EmployeeStatus_ByDate(dateadd(dd, 1, @ToDate))
+
+	SELECT l.*
+	INTO #tblLvHistory
+	FROM tblLvHistory l
+	INNER JOIN #EmployeeList e ON l.EmployeeID = e.EmployeeID
+	WHERE LeaveDate BETWEEN @FromDate AND @ToDate
+
+	--lay trang thai ben bang history cho chinh xac
+	-- UPDATE #EmployeeList
+	-- SET EmployeeStatusID = stt.EmployeeStatusID
+	-- FROM #EmployeeList te
+	-- INNER JOIN #fn_EmployeeStatus_ByDate stt ON te.EmployeeID = stt.EmployeeID
+	-- WHERE te.EmployeeStatusID <> stt.EmployeeStatusID
+
+	-- UPDATE #EmployeeList
+	-- SET EmployeeStatusID = stt.EmployeeStatusID, TerminateDate = stt.ChangedDate, LastWorkingDate = dateadd(dd, - 1, stt.ChangedDate)
+	-- FROM #EmployeeList te
+	-- INNER JOIN #fn_EmployeeStatus_ByDate_FirstLastMonth stt ON te.EmployeeID = stt.EmployeeID
+	-- WHERE stt.EmployeeStatusID = 20
+
+	-- UPDATE #EmployeeList
+	-- SET TerminatedStaff = 1
+	-- WHERE TerminateDate IS NOT NULL
+
+	SELECT *
+	INTO #CurrentSalary
+	FROM dbo.fn_CurrentSalaryHistoryIDByDate(@ToDate)
+
+	--Những người có 2 dòng công = 2 dòng lương
+	INSERT INTO #tblAttendanceSummary (Year, Month, EmployeeID, PeriodID, SalaryHistoryID, FromDate, ToDate, PercentProbation)
+	SELECT @Year, @Month, sh.EmployeeID, 0, sh.SalaryHistoryID, CASE
+			WHEN sh.DATE < @FromDate
+				THEN @FromDate
+			ELSE sh.DATE
+			END, @ToDate, te.PercentProbation
+	FROM #EmployeeList te
+	INNER JOIN #CurrentSalary s ON te.EmployeeID = s.EmployeeID
+	INNER JOIN tblSalaryHistory sh ON s.SalaryHistoryID = sh.SalaryHistoryID
+	WHERE sh.DATE >= te.HireDate
+
+	-- INSERT INTO #tblAttendanceSummary (Year, Month, EmployeeID, PeriodID, SalaryHistoryID, FromDate, ToDate, PercentProbation)
+	-- SELECT @Year, @Month, sh.EmployeeID, 1, sh.SalaryHistoryID, CASE
+	-- 		WHEN sh.DATE < @FromDate
+	-- 			THEN @FromDate
+	-- 		ELSE sh.DATE
+	-- 		END, @ToDate, te.PercentProbation
+	-- FROM #EmployeeList te
+	-- INNER JOIN tblSalaryHistory sh ON te.EmployeeID = sh.EmployeeID
+	-- WHERE sh.SalaryHistoryID NOT IN (
+	-- 		SELECT SalaryHistoryID
+	-- 		FROM #CurrentSalary
+	-- 		) AND [Date] > @FromDate AND NOT EXISTS (
+	-- 		SELECT 1
+	-- 		FROM #tblAttendanceSummary s
+	-- 		WHERE sh.SalaryHistoryID = s.SalaryHistoryID
+	-- 		) AND sh.DATE <= @ToDate AND ISNULL(te.isForeign, 0) = 0
+
+	INSERT INTO #tblAttendanceSummary (Year, Month, EmployeeID, PeriodID, SalaryHistoryID, FromDate, ToDate, PercentProbation)
+    SELECT @Year, @Month, sh.EmployeeID, 1, sh.SalaryHistoryID,
+        CASE WHEN sh.DATE < @FromDate THEN @FromDate ELSE sh.DATE END, @ToDate, te.PercentProbation
+    FROM #EmployeeList te
+    INNER JOIN tblSalaryHistory sh ON te.EmployeeID = sh.EmployeeID
+    LEFT JOIN #CurrentSalary cs ON sh.SalaryHistoryID = cs.SalaryHistoryID
+    WHERE cs.SalaryHistoryID IS NULL AND sh.Date > @FromDate
+        AND NOT EXISTS (
+            SELECT 1 FROM #tblAttendanceSummary s WHERE sh.SalaryHistoryID = s.SalaryHistoryID
+        ) AND sh.DATE <= @ToDate AND ISNULL(te.isForeign, 0) = 0
+
+
+	--Thử việc
+	IF EXISTS (
+			SELECT 1
+			FROM #tblAttendanceSummary sh
+			INNER JOIN #EmployeeList e ON sh.EmployeeID = e.EmployeeID
+			WHERE (ProbationEndDate BETWEEN @FromDate AND @ToDate OR ProbationEndDate > @ToDate) AND HireDate <> ProbationEndDate
+			)
+	BEGIN
+		UPDATE #tblAttendanceSummary
+		SET PercentProbation = ISNULL(CASE
+					WHEN ISNULL(tsh.PercentProbation, 0) = 0
+						THEN NULL
+					ELSE tsh.PercentProbation
+					END, sh.PercentProbation)
+		FROM #tblAttendanceSummary sh
+		INNER JOIN #EmployeeList e ON sh.EmployeeID = e.EmployeeID
+		LEFT JOIN tblSalaryHistory tsh ON sh.SalaryHistoryID = tsh.SalaryHistoryID
+		WHERE (e.ProbationEndDate BETWEEN @FromDate AND @ToDate OR e.ProbationEndDate > @ToDate) AND e.HireDate <> e.ProbationEndDate
+
+		UPDATE #tblAttendanceSummary
+		SET PercentProbation = NULL
+		FROM #tblAttendanceSummary sh
+		INNER JOIN #EmployeeList e ON sh.EmployeeID = e.EmployeeID
+		WHERE e.ProbationEndDate IS NULL OR e.ProbationEndDate < @FromDate
+
+		INSERT INTO #tblAttendanceSummary (Year, Month, EmployeeID, PeriodID, SalaryHistoryID, FromDate, ToDate, PercentProbation)
+		SELECT @Year, @Month, sh.EmployeeID, 1, sh.SalaryHistoryID, CASE
+				WHEN @FromDate < HireDate
+					THEN HireDate
+				ELSE @FromDate
+				END, ProbationEndDate, sh.PercentProbation
+		FROM #tblAttendanceSummary sh
+		INNER JOIN #EmployeeList e ON sh.EmployeeID = e.EmployeeID
+		WHERE e.ProbationEndDate BETWEEN @FromDate AND @ToDate AND e.HireDate <> e.ProbationEndDate
+
+		--het thu viec trong thang nay
+		UPDATE #tblAttendanceSummary
+		SET FromDate = DATEADD(day, 1, ProbationEndDate), PercentProbation = 100
+		FROM #tblAttendanceSummary sh
+		INNER JOIN #EmployeeList e ON sh.EmployeeID = e.EmployeeID
+		WHERE ISNULL(sh.PercentProbation, 0) > 0 AND ProbationEndDate BETWEEN @FromDate AND @ToDate
+	END
+
+	SELECT ot.EmployeeID, ot.OTDate, ot.ApprovedHours, ot.OTKind
+	INTO #tblOTList
+	FROM tblOTList ot
+	INNER JOIN #EmployeeList e ON ot.EmployeeID = e.EmployeeID
+	WHERE ot.OTDate BETWEEN @FromDate AND @ToDate AND ot.Approved = 1 AND ApprovedHours <> 0
+
+	IF (@Payroll = 0)
+	BEGIN
+		CREATE TABLE #Tadata (EmployeeID VARCHAR(20), Attdate DATE, HireDate DATE, EmployeeStatusID INT, HolidayStatus INT, WorkingTime FLOAT(53), Std_Hour_PerDays FLOAT(53), Lvamount FLOAT(53), PaidAmount_Des FLOAT(53), UnpaidAmount_Des FLOAT(53), SalaryHistoryID INT, CutSI BIT, EmployeeTypeID INT)
+
+		SET ANSI_NULLS ON;
+		SET ANSI_PADDING ON;
+		SET ANSI_WARNINGS ON;
+		SET ARITHABORT ON;
+		SET CONCAT_NULL_YIELDS_NULL ON;
+		SET QUOTED_IDENTIFIER ON;
+		SET NUMERIC_ROUNDABORT OFF;
+
+		EXEC sp_WorkingTimeProvider @Month = @Month, @Year = @Year, @fromdate = @FromDate, @todate = @ToDate, @loginId = @LoginID
+	END
+
+	DECLARE @ROUND_TOTAL_WORKINGDAYS INT
+
+	SET @ROUND_TOTAL_WORKINGDAYS = (
+			SELECT [Value]
+			FROM tblParameter
+			WHERE Code = 'ROUND_TOTAL_WORKINGDAYS'
+			)
+	SET @ROUND_TOTAL_WORKINGDAYS = ISNULL(@ROUND_TOTAL_WORKINGDAYS, 2)
+
+	DELETE
+	FROM #Tadata
+	WHERE Attdate < HireDate
+
+	--Người nước ngoài mặc định full công - trường hợp vào làm/nghỉ làm giữa tháng
+	UPDATE att
+	SET WorkingTime = 8, Std_Hour_PerDays = 8
+	FROM #Tadata att
+	INNER JOIN #EmployeeList e ON att.EmployeeID = e.EmployeeID
+	WHERE ISNULL(e.IsForeign, 0) = 1 AND (e.HireDate BETWEEN @FromDate AND @ToDate OR e.TerminateDate BETWEEN @FromDate AND @ToDate)
+
+    SELECT ta.EmployeeID, ta.SalaryHistoryID, SUM(CASE
+				WHEN ISNULL(HolidayStatus, 0) <> 1
+					THEN 1
+				ELSE 0
+				END) AS STD_PerHistoryID, ROUND(SUM(CASE
+					WHEN ISNULL(HolidayStatus, 0) = 0
+						THEN ta.WorkingTime / isnull(ta.Std_Hour_PerDays, 8)
+					ELSE 0
+					END), @ROUND_TOTAL_WORKINGDAYS) AS AttDays, ROUND(SUM(CASE
+					WHEN ISNULL(HolidayStatus, 0) = 0
+						THEN ta.WorkingTime
+					ELSE 0
+					END), @ROUND_TOTAL_WORKINGDAYS) AS AttHrs, SUM(ta.PaidAmount_Des) AS PaidLeaveHrs, SUM(ta.PaidAmount_Des / isnull(ta.Std_Hour_PerDays, 8)) AS PaidLeaveDays, SUM(ta.UnpaidAmount_Des) AS UnpaidLeaveHrs, SUM(ta.UnpaidAmount_Des / isnull(ta.Std_Hour_PerDays, 8)) AS UnpaidLeaveDays, SUM(CASE
+				WHEN HolidayStatus = 1
+					THEN 1
+				ELSE 0
+				END) AS TotalSunDay, SUM(CASE
+				WHEN CutSI = 1 AND HolidayStatus <> 1
+					THEN 1
+				ELSE 0
+				END) TotalNonWorkingDays, ta.Std_Hour_PerDays, s.PeriodID
+	INTO #tblSal_AttendanceData
+	FROM #Tadata ta
+	INNER JOIN #tblAttendanceSummary s ON ta.EmployeeID = s.EmployeeID AND ta.AttDate BETWEEN s.FromDate AND s.ToDate
+	GROUP BY ta.EmployeeID, ta.SalaryHistoryID, ta.Std_Hour_PerDays, s.PeriodID
+
+	SELECT EmployeeID, SaturdayDate AS SatDate
+	INTO #SatWorkList
+	FROM dbo.fn_GetEmployeeSatWork(@LoginID, @Month, @Year)
+	--WHERE SaturdayDate BETWEEN @FromDate AND @ToDate
+	
+	UNION
+	
+	SELECT EmployeeID, SaturdayDate_2nd AS SatDate
+	FROM dbo.fn_GetEmployeeSatWork(@LoginID, @Month, @Year)
+
+	-- Đếm số ngày thứ 7 cho từng nhân viên theo HireDate và TerminateDate
+	UPDATE s
+	SET AttHrs = ISNULL(s.AttHrs, 0) + (ISNULL(s.Std_Hour_PerDays, 8) * SatCount), AttDays = ISNULL(s.AttDays, 0) + SatCount
+	FROM #tblSal_AttendanceData s
+	INNER JOIN #EmployeeList e ON s.EmployeeID = e.EmployeeID
+	INNER JOIN #tblAttendanceSummary ta ON ta.EmployeeID = s.EmployeeID AND s.PeriodID = ta.PeriodID
+	CROSS APPLY (
+		SELECT COUNT(*) AS SatCount
+		FROM (
+			SELECT TOP (
+					DATEDIFF(DAY, CASE
+							WHEN e.HireDate > FromDate
+								THEN e.HireDate
+							ELSE FromDate
+							END, CASE
+							WHEN e.TerminateDate IS NOT NULL AND e.TerminateDate < ToDate
+								THEN e.TerminateDate
+							ELSE ToDate
+							END) + 1
+					) DATEADD(DAY, ROW_NUMBER() OVER (
+						ORDER BY (
+								SELECT NULL
+								)
+						) - 1, CASE
+						WHEN e.HireDate > FromDate
+							THEN e.HireDate
+						ELSE FromDate
+						END) AS TheDate
+			FROM sys.all_objects
+			) AS Dates
+		WHERE DATENAME(WEEKDAY, TheDate) = 'Saturday' AND TheDate NOT IN (
+				SELECT SatDate
+				FROM #SatWorkList sat
+				WHERE sat.EmployeeID = e.EmployeeID
+				)
+		) Sat
+	WHERE e.isLocalStaff = 1 AND e.HireDate <= @ToDate AND (e.TerminateDate IS NULL OR e.TerminateDate >= @FromDate)
+
+	UPDATE #tblAttendanceSummary
+	SET WorkingHrs_Total = ISNULL(ta.AttHrs, 0), WorkingDays_Total = ISNULL(ta.AttDays, 0), PaidLeaveDays_Total = ta.PaidLeaveDays, Std_Hour_PerDays = ta.Std_Hour_PerDays, PaidLeaveHrs_Total = ta.PaidLeaveHrs, UnpaidLeaveDays = ta.UnpaidLeaveDays, UnpaidLeaveHrs = ta.UnpaidLeaveHrs
+	FROM #tblAttendanceSummary att
+	INNER JOIN #tblSal_AttendanceData ta ON att.EmployeeID = ta.EmployeeID AND att.PeriodID = ta.PeriodID
+
+	UPDATE #tblAttendanceSummary
+	SET STD_WorkingDays = wds.WorkingDays_Std
+	FROM #tblAttendanceSummary att
+	INNER JOIN #EmployeeList te ON att.EmployeeID = te.EmployeeID
+	LEFT JOIN tblWorkingDaySetting wds ON wds.EmployeeTypeID = te.EmployeeTypeID AND wds.Year = @Year AND wds.Month = @Month
+
+	UPDATE #tblAttendanceSummary
+	SET RegularWorkdays = ISNULL(wds.WorkingDays_Std, 26)
+	FROM #tblAttendanceSummary att
+	LEFT JOIN tblWorkingDaySetting wds ON wds.EmployeeTypeID = 0 AND wds.Year = @Year AND wds.Month = @Month
+
+	UPDATE att
+	SET WorkingHrs_Total = ISNULL(RegularWorkdays, 0) * STD_Hour_PerDays, WorkingDays_Total = RegularWorkdays
+	FROM #tblAttendanceSummary att
+	INNER JOIN #EmployeeList e ON att.EmployeeID = e.EmployeeID
+	WHERE ISNULL(e.IsForeign, 0) = 0 AND WorkingDays_Total > RegularWorkdays * 8
+
+	UPDATE #tblAttendanceSummary
+	SET WorkingDays_Total = ISNULL(WorkingDays_Total, 0) + ISNULL(PaidLeaveDays_Total, 0)
+	FROM #tblAttendanceSummary att
+	INNER JOIN #EmployeeList e ON att.EmployeeID = e.EmployeeID
+	WHERE ISNULL(e.IsForeign, 0) = 0
+
+	--Người nước ngoài mặc định full công - trường hợp vào làm/nghỉ làm giữa tháng
+	UPDATE att
+	SET RegularWorkdays = ISNULL(RegularWorkdays, 0), WorkingHrs_Total = (RegularWorkdays * 8), WorkingDays_Total = RegularWorkdays, Std_Hour_PerDays = 8
+	FROM #tblAttendanceSummary att
+	INNER JOIN #EmployeeList e ON att.EmployeeID = e.EmployeeID
+	WHERE ISNULL(e.IsForeign, 0) = 1 AND (e.HireDate <= @FromDate AND (e.TerminateDate IS NULL OR e.TerminateDate >= @ToDate))
+
+	DECLARE @cols NVARCHAR(MAX), @assign NVARCHAR(MAX), @sql NVARCHAR(MAX)
+
+	SELECT @cols = (
+		SELECT ',' + QUOTENAME(LeaveCode)
+		FROM tblLeaveType
+		WHERE IsVisible = 1
+		FOR XML PATH(''), TYPE
+	).value('.', 'NVARCHAR(MAX)')
+	SET @cols = STUFF(@cols, 1, 1, '')
+
+	SELECT @assign = (
+		SELECT ',s.' + QUOTENAME(LeaveCode) + ' = ISNULL(p.' + QUOTENAME(LeaveCode) + ',0)'
+		FROM tblLeaveType
+		WHERE IsVisible = 1
+		FOR XML PATH(''), TYPE
+	).value('.', 'NVARCHAR(MAX)')
+	SET @assign = STUFF(@assign, 1, 1, '')
+
+	SET @sql = N'
+		;WITH lv AS (
+			SELECT EmployeeID, LeaveCode, SUM(ISNULL(LvAmount,0)) AS LvAmount
+			FROM #tblLvHistory
+			GROUP BY EmployeeID, LeaveCode
+		)
+		SELECT * INTO #tmpLvPivot FROM (
+			SELECT EmployeeID, LeaveCode, LvAmount FROM lv
+		) src
+		PIVOT (SUM(LvAmount) FOR LeaveCode IN (' + @cols + N')) AS pvt;
+
+		UPDATE s
+		SET ' + @assign + N'
+		FROM #tblAttendanceSummary s
+		LEFT JOIN #tmpLvPivot p ON s.EmployeeID = p.EmployeeID;
+
+		DROP TABLE #tmpLvPivot;'
+
+	EXEC sp_executesql @sql
+
+	SELECT a.*
+	INTO #ManualEdit
+	FROM tblAttendanceSummary a
+	INNER JOIN #EmployeeList s ON a.EmployeeID = s.EmployeeID
+	WHERE [Year] = @Year AND [Month] = @Month AND ISNULL(DateStatus, 0) = 3
+
+	DELETE t
+	FROM tblAttendanceSummary t
+	WHERE EXISTS (
+			SELECT 1
+			FROM #tblAttendanceSummary s
+			WHERE t.EmployeeID = s.EmployeeID AND t.Year = s.Year AND t.Month = s.Month
+			)
+
+	SET @cols = ''
+
+	SELECT @cols = (
+		SELECT ',' + QUOTENAME(name)
+		FROM sys.all_columns
+		WHERE object_id = OBJECT_ID('tblAttendanceSummary')
+		FOR XML PATH(''), TYPE
+	).value('.', 'NVARCHAR(MAX)')
+	SET @cols = STUFF(@cols, 1, 1, '')
+
+	-- Insert processed summary rows from temp table into permanent table
+	SET @sql = '
+	INSERT INTO tblAttendanceSummary (' + @cols + N')
+	SELECT ' + @cols + N'
+	FROM #tblAttendanceSummary'
+
+	EXEC sp_executesql @sql
+
+	SET @assign = ''
+
+
+	SELECT @assign = (
+		SELECT ',s.' + QUOTENAME(ISNULL(ColumnDisplayName, '')) + ' = ISNULL(p.' + QUOTENAME(ISNULL(ColumnDisplayName, '')) + ',0), ' + 's.' + QUOTENAME(ISNULL(ColumnDisplayName + '_ExcessOT', '')) + ' = ISNULL(p.' + QUOTENAME(ISNULL(ColumnDisplayName + '_ExcessOT', '')) + ', 0)'
+		FROM tblOvertimeSetting
+		FOR XML PATH(''), TYPE
+	).value('.', 'NVARCHAR(MAX)')
+	SET @assign = STUFF(@assign, 1, 1, '')
+
+	SET @assign = @assign + ' , s.TotalOT = ISNULL(p.TotalOT, 0), s.TotalExcessOT = ISNULL(p.TotalExcessOT, 0), TaxableOT = ISNULL(p.TaxableOT, 0), NonTaxableOT = ISNULL(p.NonTaxableOT, 0)'
+
+	SET @sql = '
+    UPDATE s SET ' + @assign + N'
+		FROM tblAttendanceSummary s
+		INNER JOIN #ManualEdit p ON s.EmployeeID = p.EmployeeID AND s.Year = p.Year AND s.Month = p.Month AND s.PeriodID = p.PeriodID
+    '
+	EXEC sp_executesql @sql
+
+
+	EXEC sp_accumulatedOT @LoginID = @LoginID, @Month = @Month, @Year = @Year, @MaxOT = 40, @isView = 1
+
+	IF (ISNULL(@ViewType, 0) = 1)
+		SELECT *
+		FROM tblAttendanceSummary t
+		WHERE EXISTS (
+				SELECT 1
+				FROM #tblAttendanceSummary s
+				WHERE t.EmployeeID = s.EmployeeID AND t.Year = s.Year AND t.Month = s.Month
+				)
+			--exec sp_processSummaryAttendance 3,2025,7
+END
+GO
+
+
+
+
+
+IF OBJECT_ID('tempdb..#Paradise') IS NOT NULL DROP TABLE #Paradise
+
+  create table #Paradise (
+   [name] [nvarchar](MAX) NULL 
+ , [IsEncrypted] [bit] NULL 
+ , [type_desc] [nvarchar](MAX) NULL 
+ , [ss_ViewDependencyOBject] [nvarchar](MAX) NULL 
+)
+
+
+ INSERT INTO #Paradise([name],[IsEncrypted],[type_desc],[ss_ViewDependencyOBject])
+Select  N'sp_exportSummaryTimesheet' as [name],N'False' as [IsEncrypted],N'SQL_STORED_PROCEDURE' as [type_desc],NULL as [ss_ViewDependencyOBject] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthlyInOutExport' as [name],N'False' as [IsEncrypted],N'SQL_STORED_PROCEDURE' as [type_desc],NULL as [ss_ViewDependencyOBject] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD' as [name],N'False' as [IsEncrypted],N'SQL_STORED_PROCEDURE' as [type_desc],NULL as [ss_ViewDependencyOBject]
+select * from #Paradise
+GO
+
+--#region tblDataSetting
+IF OBJECT_ID('tempdb..#tblDataSetting') IS NOT NULL DROP TABLE #tblDataSetting
+  create table #tblDataSetting (
+   [TableName] [nvarchar](MAX) NULL 
+ , [ViewName] [nvarchar](MAX) NULL 
+ , [AllowAdd] [bit] NULL 
+ , [ReadOnlyColumns] [nvarchar](MAX) NULL 
+ , [ComboboxColumns] [nvarchar](MAX) NULL 
+ , [ColumnOrderBy] [nvarchar](MAX) NULL 
+ , [ColumnHide] [nvarchar](MAX) NULL 
+ , [ReadOnly] [bit] NULL 
+ , [TableEditorName] [nvarchar](MAX) NULL 
+ , [IsProcedure] [bit] NULL 
+ , [PaintColumns] [nvarchar](MAX) NULL 
+ , [FormatFontColumns] [nvarchar](MAX) NULL 
+ , [PaintRows] [nvarchar](MAX) NULL 
+ , [IsProcessForm] [bit] NULL 
+ , [IsShowLayout] [bit] NULL 
+ , [IsBatch] [bit] NULL 
+ , [LoadDataAfterShow] [bit] NULL 
+ , [GroupColumns] [nvarchar](MAX) NULL 
+ , [FixedColumns] [nvarchar](MAX) NULL 
+ , [ExportName] [nvarchar](MAX) NULL 
+ , [CheckLockAttStore] [nvarchar](MAX) NULL 
+ , [RptTemplate] [nvarchar](MAX) NULL 
+ , [spAction] [nvarchar](MAX) NULL 
+ , [DefaultValue] [nvarchar](MAX) NULL 
+ , [FilterColumn] [nvarchar](MAX) NULL 
+ , [IsEditForm] [bit] NULL 
+ , [ColumnEditSpecial] [nvarchar](MAX) NULL 
+ , [ColumnsFormatExtend] [nvarchar](MAX) NULL 
+ , [AllowDelete] [bit] NULL 
+ , [PaintCells] [nvarchar](MAX) NULL 
+ , [LayoutDataConfig] varbinary(max) NULL 
+ , [ColumnDataType] [nvarchar](MAX) NULL 
+ , [ProcBeforeSave] [nvarchar](MAX) NULL 
+ , [ProcAfterSave] [nvarchar](MAX) NULL 
+ , [IsLayoutParam] [bit] NULL 
+ , [ColumnSearch] [nvarchar](MAX) NULL 
+ , [AlwaysReloadColumn] [bit] NULL 
+ , [NotReloadAfterSave] [bit] NULL 
+ , [ColumnChangeEventProc] [nvarchar](MAX) NULL 
+ , [RowFontStyle] [nvarchar](MAX) NULL 
+ , [isWrapHeader] [bit] NULL 
+ , [ContextMenuIDs] [nvarchar](MAX) NULL 
+ , [ColumnNotLock] [nvarchar](MAX) NULL 
+ , [Import] [nvarchar](MAX) NULL 
+ , [ProcBeforeDelete] [nvarchar](MAX) NULL 
+ , [ProcAfterDelete] [nvarchar](MAX) NULL 
+ , [ConditionFormatting] varbinary(max) NULL 
+ , [ViewGridInShowLayout] [bit] NULL 
+ , [ShortcutsControl] [nvarchar](MAX) NULL 
+ , [LblMessage] [nvarchar](MAX) NULL 
+ , [MinWidthColumn] [nvarchar](MAX) NULL 
+ , [IsLayoutCommandButton] [bit] NULL 
+ , [LayoutDataConfigCrazy] varbinary(max) NULL 
+ , [NavigatorProcedure] [nvarchar](MAX) NULL 
+ , [ValidateRowConditions] [nvarchar](MAX) NULL 
+ , [ExecuteProcBeforeLoadData] [nvarchar](MAX) NULL 
+ , [LayoutDataConfigWeb] varbinary(max) NULL 
+ , [LayoutDataConfigMobile] varbinary(max) NULL 
+ , [GridBandConfig] [nvarchar](MAX) NULL 
+ , [ControlStateProcedure] [nvarchar](MAX) NULL 
+ , [ValidationProcedures] [nvarchar](MAX) NULL 
+ , [ReadonlyCellCondition] [nvarchar](MAX) NULL 
+ , [ComboboxColumn_BackupForTransfer] [nvarchar](MAX) NULL 
+ , [IsOpenSubForm] [bit] NULL 
+ , [Validation] [nvarchar](MAX) NULL 
+ , [ControlHiddenInShowLayout] [nvarchar](MAX) NULL 
+ , [IgnoreColumnOrder] [bit] NULL 
+ , [IgnoreLock] [bit] NULL 
+ , [ReadonlyCellCondition_Backup] [nvarchar](MAX) NULL 
+ , [SubDataSettingNames] [nvarchar](MAX) NULL 
+ , [IsViewReportForm] [bit] NULL 
+ , [ExportSeparateButton] [bit] NULL 
+ , [HashLayoutConfig] [nvarchar](MAX) NULL 
+ , [LayoutDataConfigFillter] varbinary(max) NULL 
+ , [LayoutParamConfig] varbinary(max) NULL 
+ , [OpenFormLink] [nvarchar](MAX) NULL 
+ , [SaveTableByBulk] [nvarchar](MAX) NULL 
+ , [IsNotPaintSaturday] [bit] NULL 
+ , [IsNotPaintSunday] [bit] NULL 
+ , [IsViewWeekName] [bit] NULL 
+ , [IgnoreCheckEECode] [bit] NULL 
+ , [ParadiseCommand] [int] NULL 
+ , [Labels] [nvarchar](MAX) NULL 
+ , [ColumnHideExport] [nvarchar](MAX) NULL 
+ , [ColumnWidthCalcData] [bit] NULL 
+ , [HideHeaderFilterButton] [bit] NULL 
+ , [HideColumnGrid] [bit] NULL 
+ , [TypeGrid] [int] NULL 
+ , [ProcBeforeAdd] [nvarchar](MAX) NULL 
+ , [ProcAfterAdd] [nvarchar](MAX) NULL 
+ , [ExecuteProcAfterLoadData] [nvarchar](MAX) NULL 
+ , [LayoutDataConfigColumnView] varbinary(max) NULL 
+ , [LayoutDataConfigCardView] varbinary(max) NULL 
+ , [HideFooter] [int] NULL 
+ , [IsFilterBox] [bit] NULL 
+ , [GetDefaultParamFromDB] [bit] NULL 
+ , [TaskTimeLine] [int] NULL 
+ , [HtmlCell] [int] NULL 
+ , [MinPageSizeGrid] [int] NULL 
+ , [ClickHereToAddNew] [int] NULL 
+ , [IgnoreQuestion] [bit] NULL 
+ , [FormLayoutJS] [int] NULL 
+ , [CheckBoxText] [int] NULL 
+ , [ColumnHideMobile] [nvarchar](MAX) NULL 
+ , [LayoutMobileLocalConfig] varbinary(max) NULL 
+ , [ViewMode] [int] NULL 
+ , [Mode] [int] NULL 
+ , [Template] [nvarchar](MAX) NULL 
+ , [NotResizeImage] [int] NULL 
+ , [DeleteOneRowReloadData] [int] NULL 
+ , [AutoHeightGrid] [bit] NULL 
+ , [ProcFileName] [nvarchar](MAX) NULL 
+ , [HeightImagePercentHeightFont] [float] NULL 
+ , [ColumnMinWidthPercent] [nvarchar](MAX) NULL 
+ , [GridViewAutoAddRow] [int] NULL 
+ , [GridViewNewItemRowPosition] [int] NULL 
+ , [LastColumnRemainingWidth] [int] NULL 
+ , [IsAutoSave] [bit] NULL 
+ , [VirtualColumn] [nvarchar](MAX) NULL 
+ , [GridTypeview] [int] NULL 
+ , [selectionMode] [int] NULL 
+ , [deleteMode] [int] NULL 
+ , [ClearDataBeforeLoadData] [int] NULL 
+ , [LockSort] [bit] NULL 
+ , [HightLightControlProc] [nvarchar](MAX) NULL 
+ , [ScriptInit0] [nvarchar](MAX) NULL 
+ , [ScriptInit1] [nvarchar](MAX) NULL 
+ , [ScriptInit2] [nvarchar](MAX) NULL 
+ , [ScriptInit3] [nvarchar](MAX) NULL 
+ , [ScriptInit4] [nvarchar](MAX) NULL 
+ , [ScriptInit5] [nvarchar](MAX) NULL 
+ , [ScriptInit6] [nvarchar](MAX) NULL 
+ , [ScriptInit7] [nvarchar](MAX) NULL 
+ , [ScriptInit8] [nvarchar](MAX) NULL 
+ , [ScriptInit9] [nvarchar](MAX) NULL 
+ , [FontSizeZoom0] [float] NULL 
+ , [FontSizeZoom1] [float] NULL 
+ , [FontSizeZoom2] [float] NULL 
+ , [FontSizeZoom3] [float] NULL 
+ , [FontSizeZoom4] [float] NULL 
+ , [FontSizeZoom5] [float] NULL 
+ , [FontSizeZoom6] [float] NULL 
+ , [FontSizeZoom7] [float] NULL 
+ , [FontSizeZoom8] [float] NULL 
+ , [FontSizeZoom9] [float] NULL 
+ , [NotBuildForm] [bit] NULL 
+ , [NotUseCancelButton] [bit] NULL 
+ , [GridUICompact] [float] NULL 
+ , [DisableFilterColumns] [nvarchar](MAX) NULL 
+ , [DisableFilterAll] [int] NULL 
+)
+
+ INSERT INTO #tblDataSetting([TableName],[ViewName],[AllowAdd],[ReadOnlyColumns],[ComboboxColumns],[ColumnOrderBy],[ColumnHide],[ReadOnly],[TableEditorName],[IsProcedure],[PaintColumns],[FormatFontColumns],[PaintRows],[IsProcessForm],[IsShowLayout],[IsBatch],[LoadDataAfterShow],[GroupColumns],[FixedColumns],[ExportName],[CheckLockAttStore],[RptTemplate],[spAction],[DefaultValue],[FilterColumn],[IsEditForm],[ColumnEditSpecial],[ColumnsFormatExtend],[AllowDelete],[PaintCells],[LayoutDataConfig],[ColumnDataType],[ProcBeforeSave],[ProcAfterSave],[IsLayoutParam],[ColumnSearch],[AlwaysReloadColumn],[NotReloadAfterSave],[ColumnChangeEventProc],[RowFontStyle],[isWrapHeader],[ContextMenuIDs],[ColumnNotLock],[Import],[ProcBeforeDelete],[ProcAfterDelete],[ConditionFormatting],[ViewGridInShowLayout],[ShortcutsControl],[LblMessage],[MinWidthColumn],[IsLayoutCommandButton],[LayoutDataConfigCrazy],[NavigatorProcedure],[ValidateRowConditions],[ExecuteProcBeforeLoadData],[LayoutDataConfigWeb],[LayoutDataConfigMobile],[GridBandConfig],[ControlStateProcedure],[ValidationProcedures],[ReadonlyCellCondition],[ComboboxColumn_BackupForTransfer],[IsOpenSubForm],[Validation],[ControlHiddenInShowLayout],[IgnoreColumnOrder],[IgnoreLock],[ReadonlyCellCondition_Backup],[SubDataSettingNames],[IsViewReportForm],[ExportSeparateButton],[HashLayoutConfig],[LayoutDataConfigFillter],[LayoutParamConfig],[OpenFormLink],[SaveTableByBulk],[IsNotPaintSaturday],[IsNotPaintSunday],[IsViewWeekName],[IgnoreCheckEECode],[ParadiseCommand],[Labels],[ColumnHideExport],[ColumnWidthCalcData],[HideHeaderFilterButton],[HideColumnGrid],[TypeGrid],[ProcBeforeAdd],[ProcAfterAdd],[ExecuteProcAfterLoadData],[LayoutDataConfigColumnView],[LayoutDataConfigCardView],[HideFooter],[IsFilterBox],[GetDefaultParamFromDB],[TaskTimeLine],[HtmlCell],[MinPageSizeGrid],[ClickHereToAddNew],[IgnoreQuestion],[FormLayoutJS],[CheckBoxText],[ColumnHideMobile],[LayoutMobileLocalConfig],[ViewMode],[Mode],[Template],[NotResizeImage],[DeleteOneRowReloadData],[AutoHeightGrid],[ProcFileName],[HeightImagePercentHeightFont],[ColumnMinWidthPercent],[GridViewAutoAddRow],[GridViewNewItemRowPosition],[LastColumnRemainingWidth],[IsAutoSave],[VirtualColumn],[GridTypeview],[selectionMode],[deleteMode],[ClearDataBeforeLoadData],[LockSort],[HightLightControlProc],[ScriptInit0],[ScriptInit1],[ScriptInit2],[ScriptInit3],[ScriptInit4],[ScriptInit5],[ScriptInit6],[ScriptInit7],[ScriptInit8],[ScriptInit9],[FontSizeZoom0],[FontSizeZoom1],[FontSizeZoom2],[FontSizeZoom3],[FontSizeZoom4],[FontSizeZoom5],[FontSizeZoom6],[FontSizeZoom7],[FontSizeZoom8],[FontSizeZoom9],[NotBuildForm],[NotUseCancelButton],[GridUICompact],[DisableFilterColumns],[DisableFilterAll])
+Select  N'sp_attendancesummarymonthly_std_Datasetting' as [TableName],N'sp_AttendanceSummaryMonthly_STD' as [ViewName],N'True' as [AllowAdd],N',' as [ReadOnlyColumns],N'' as [ComboboxColumns],N'STT&0,EmployeeID&1,FullName&2,DepartmentName&3,HireDate&4,PositionName&5,ProbationEndDate&6,STD_WorkingDays&7,Actual_WorkingDays&8,TotalPaidDays&9,WorkHours&10,PaidLeaveHrs&11,UnpaidLeave&12,IOHrs&13,TotalOT&14,TotalNS&15,TotalDayOff&16,A&17,P&18,M&19,M1&20,S&21,S2&22,SP3&23,O&24,L&25,B1&26,AWP&27,OT1&28,OT2a&29,OT3&30,OT4&31,OT5&32,1Att&33,2Att&34,3Att&35,4Att&36,5Att&37,6Att&38,7Att&39,8Att&40,9Att&41,10Att&42,11Att&43,12Att&44,13Att&45,14Att&46,15Att&47,16Att&48,17Att&49,18Att&50,19Att&51,20Att&52,21Att&53,22Att&54,23Att&55,24Att&56,25Att&57,26Att&58,27Att&59,28Att&60,29Att&61,30Att&62,31Att&63,ForgetTimekeeper&64,Signture&65' as [ColumnOrderBy],N'isReadOnlyRow,dtftxxENGColumns' as [ColumnHide],N'False' as [ReadOnly],N'' as [TableEditorName],N'True' as [IsProcedure],N'Saturday&%Out&%In#CCFFCC ,Sunday&%Out&%In#FCD5B4,DepartmentName#e8760c' as [PaintColumns],N'' as [FormatFontColumns],N'' as [PaintRows],N'False' as [IsProcessForm],N'False' as [IsShowLayout],N'False' as [IsBatch],N'True' as [LoadDataAfterShow],N'SectionName&SectionPriority' as [GroupColumns],N'STT,EmployeeID,FullName,DepartmentName,HireDate' as [FixedColumns],N'' as [ExportName],N'' as [CheckLockAttStore],N'Export_AttandanceMonth,AttendanceSheet,SummaryTimesheet' as [RptTemplate],N'' as [spAction],N'' as [DefaultValue],N'' as [FilterColumn],N'False' as [IsEditForm],N'' as [ColumnEditSpecial],N'' as [ColumnsFormatExtend],N'True' as [AllowDelete],N'' as [PaintCells],0x1F8B0800000000000400ED9DCF6FDB4896C7F7BCC0FE0F8416989337AD5F96E54CDB8863C7B181C4096C25764E034AAA488429522029FFE86B1FE6B8E8C31E06734963D187E99DC1CE6EF7C93EF441C1FC1FFA0BF65FD8E20F59B44C8AAF8AB22591DF07231DA7F94A64BDAAC7579FF754F57FB7BF7D7BE658EA09B33455D7BE639672C12C5B338DAD42E959B1A0A8FDBEAEB554C7FB97DD81ED98BD37EAB53970764DC3B14CBDB0FD2FFFAC28DFF62DB3CF2CE75A31D41EDB2AFCAB7FCD47BFA982F24DE455EFFA6EB3F6BED91AD80545B38D81AE6F151C6BC0DCDFCED975F08BA7FC507DA7E56817AAC34E98CE5A0E6B0777F4CE786D3A7E9BDBAEFAB7DF8CF5E2DAD175F3D253B86BE18DDA64FA2E7FF0F3C2F66755B7931B7965A84D9DED0C1CB3A136DF596D66C97FFAF8C1DABCA9F76A8751EF61D2D46BCB1CF4C59F9F7F5E93B525958F99DA360DFDFA555B734C8BAAFFD6BC60BEBAD6E93A0DF30DFBEC509FF74E774FB3F8087047DAF64ECB326DBBD165C69E79694C3531FDEB547B6F4CF37CC768EF33A64B0CC79373CD38E27F2B6CEFB18B57577D8BD9B672E25CEBC90FE25D55D8765B48BCF683CDF6D86775A03BE1DBA57536D73DD58CB679699FBDE75DD48B195909DD74E8B09E7DBF4B940B551FF0FF55AEC6F58EAB5422F4EA43CDC6759FF9FDEA3B156F783E78D408BDC9607EAF5ACC70BC46025714A5E05DFAD274E7AEFD51B3B5A61E3BF362E6C19EA55EBE545BE71DDE92D18E314A9CEF3834DAFC26ED53CDE9F2A70CEEA3B0DDA0B511F852B79B1BECCA21F574449F71D5861938A23DCD7654A3C5152A113710ADBCA36B1DE3ADD9E64A7CB0F9FD1EDC5AD443243FD7AEEA691FF6B81FBC330AB15FF75D934C5C83EB5A1AA6E76708CAFE60F31FE5987506BA6A09DEEE1BD37F6FBA0EC19BB082FAEE80B82A6CFF5B893AFCFC31B36BEAA6F55267465B333A82635060CC5EF555A3FD8E7BD901D79BF9AA8C5316F8B4B1C7F36CE23A84C2368F2D1C1E98E804ED93AE7919BC4A7775D3662F078EE39A45686E1F383DFDC4B1789F1E1A8195C8B7EF35F05ABFEE775D176F7876A18F8960FEBCE79F2D3BAF77FA7DA65AEE64F69CDCF8FE698D454C2CD362DE300BBBD3A80B432332F152EE37C52E2C275DB9CFFD187FABB28EC9940F876B4AA9D88FEAEF28D5D796DAD6B8EFF2E7FF816969DFF1C622475BDC279FF0687A8FE98E5AD82E8AA8B9B140A017EF77227D67CCC0F306CE3DBBC78D5BF20B21D227CDFA78818F9C8C55F76586319AF9317ACFDEE36525CC9E2BB30BC4ACB079466C8E28249366A747B40D77C9115AD44B06B7C77C95C73E6B86E6351A0D268AF7ADF460D965EA839E21D60A65E1C13BBFB0FDA2BA76AAB59DEE56A9562EBEA8AC1D307709BAB559D9242F95FC158B3094082BFB63E8C8B47AA435D30153F99CF1556D9995AC67D1006C1D1A5D66690E6B53B04D74C4193578A35427B7DA30299468E292C6B0556E10FAFD95375F567FB69E6D671667680FD153C70ACCBDEAE6E67EC8C76330783E0C7E603A0D8B771B4C9E0393FB60D87D10183B63C6168A00D32C42620600D9FC44E3534D2F6FF854669732BABCC9695960777A7B0B30DA2A22589CFAB52EDA77AA00A388E4DF7B963A33DD13AB66F667AEB76496D902443D62951D24246956E4D79FF0D567619B962AF057E0429FE0ABC47F88400F99A6DED064A7FE9DF6AC09185CD4D01C9D91AE3C6C99869FE93C320D5AE6E4B0D7636D4D75D8F88E624141CC989BE438C506AC77AF945E085D48E889D0D512BD115455846E8D9E8372B5D2F4A6AB2FD0A384917AA4BA1530C7A649612F69386BCC14918E8C3ED8CCE532E36666D880F66E58EAD76CF849653BEC94DFFBA9A5F2F1E6FE99A6AB88DC39636F7C5AB1976B29619ECADF352D6F2A17D794E0877443EDB6B8D60464BE28AD9D6D15F99F9FB6288A6EB5CBA1712F7CE1B3A6472E56F15271D12FD4E917F0F467D0554F1CD5728ED8E51BCD10E87FCF609AAE39D785ED1DFD52BD7E5854965803E97AC4F25C0A110346ED3648E92CFF6ABF8156F3EAC55BFE0FDDA7A83E9AAACB736B94DD194ACC5FF0FBB61D4BD50CC7F65FC0F4148057C536DDD5F15352B8E8CD53F09EACE7AEDDB7DF6AED368F74D967F2CD354CB773265986754AA75C74041F6CAC11A4834A413AC89DD2412E48605D92A60C0CD53C8477FF3CF94AD673BD89A127AA79F2687654F3E4CFE6A8E6C9A4D90981C95BF5EA4164531E4736154A68F356338216CA410B9B1B824D046F9A5034D830FBC450D0D5E52AA25F2F39E077A7BB77E87D078DB5BD0047203C6E585ACF4F3BED584CBD8BCBC89F3FBE6DFE4FA1C716F8AE89AFCF07E27752FAA25F1999CBB72080E5EF37062C1F771FC0F2C0F211FA8F81E5F5A6FEA247C5397364F34B4EC341A0C9199B7B385A80EB4D854D95DA246C2A6D10DB882042240E960E8657D694E0470C8657D6CEB6CAD5121D87FB3D5419F75031D4451512AA9E0B4F6F74873F1A1D79A8EEEB3F5F245A8F7EB4E4DA701292AF2C1AC9371DE398E9A64AA95107920792079207B059466003240FB303C9C3E640F25935BB1092BFFBEEE966B9CC7F19AF0D8BD5B21497AF87564F65CA02135C1E5C1E5C3EF921C0E5A32E029707974FC7E5E94C075C3ED14E39E7F254961A02F3926029C5261829B17C890F07FF471CCBAF573764B17C69733158FECDF04B4F793BBAFDB3268FE645BCCC6AC2F96A4A38FFAAD777AEDD81C988645E7ADACD65E718E1507D155728B28B32990C42AA848070FA412683F070A55B0A15B19548456C116570424E3F9C8E22F7EFBC5351945D9B235C798A9414923748DEC4DF66BED01E9237303B9237B039923759353BF207D16118F207F71B43FE20EE3E903F40FE2042FF31F2071A9FBF94A5247207C936CA67EE201DA248C9F2CB6B4AF023C6F2AB6B675BA562B12E0BF3CBB5F585C07CEA748DE1F854F5C5EE5DB3BE8287E88904928F71869E70348A63F4C27E14C7E8E1183D8663F4708C5E3E10CDAC4C0D8ED1C3185DD2318A4411CC8E4451FE6C8E28249366974A38E4F118BD629DBC54C2317A38460FBE6C195E61793E452FAFD6CEEB217A79B5777ECFD0CB9FC5F37B845ED66D2D14FCE5E804BDBC143EE0003D54F4A1A28F38E650D117FAE465ADE8231502E0043D9CA097D757FE53ED937057DE2854A838A7E3F4CA6B9F9EBA3631C5997A54F5C5D626D616BD896FC76A7BC1DAABB6E698944233ECE43B53013BF9E2CBE094A000E425560D353E303B6A7C60F374531D353E59343B213049BDABD06467A3BBBDD6C247A0946BF4181B9BF8E24BF840F640F640F640F64F87ECF5A62EC874F06DFC446365885053D168EEB6F2953D612FC4C749C86EBA3ABB549D5467D76B944322E683D87FA73BBF6FB99366ABC5833FDB347ED7717E7F34BAF96DA0385DF55AF9FAC3E8F63F34A5D51DDDFEA5A5B455A3CBFF7DF857A539BAF9A9A75C0CBF984A7BF8BF4647E9B9FB017B977FEF5EF173EFD95167F8E55AE96AA3DB3F0E147D74FB3F2DE5BC3BFC955F6B8F6EFFA6F26BFFF1F7D1ED7FB61463F8B3A118DE671A0F756C55F33FF26AF88B1A7C98FB6F5F7FD0D6F85F06FC2FC35FFC8F544AF76EA6D535DDFF7963749EB98FF98DF79CEEF3C9A71484FDEA6AEE5DBCB1E89C8473E5EC6BBAC3908E98BE1CE908A423229A01AC5A4A58857404CC8E74046C8E744456CD2E998E986CF526998F28D504DB403E02F908E423921F02F988A88B908F403E225D3E82CE73908A48B453DE531102646FEA88AAF5D036BBA54DF95C0489842D321721B80FF15D2AA2520B47A7A4C79C4B26A231FC6B4F39D74637BF916871349F176B6435E17C7DD170BEE918AFAEFAA645094A57FFA835407A407A40FA2C231C407A981D901E3607A4CFAAD953437AB1E390275F1A2809B601480F480F489FFC1080F4511701D203D2A780F4425C07903ED14E7987F4F8BEC094D6F471812E6A973D2E70BDBA104A7F3618DDFCE428ECAAC5285BB9C7607A114FB39A907E73D190BED5BC7AF189910E8E43013DD83CD83CC8CD32921BB079981D6C1E36079BCFAAD953B379B102FA711D587D13F5F3D4DB6640F340F340F340F340F304FD47AA9F7F714DA43920F38966CA109997D96B5EBE7ABE5C0F55CF5376A9C949F5FC1D96AF862B3E9E6EA7FCA3AFDFA7A89A77B59F6716C5978A8B66F177E98E673B0E0F88DBEE1C38E9328602FAB8CB01E901E9239A01C2594A8403480FB303D2C3E680F459357B6A484F09E4220AE82B75C13640E941E941E9931F02943EEA22507A50FA74945E9EF300DB27DA2DE7D83E0FF5F4253E1CFC1F316AEFD5D357EB6559702F1E69CE07DCC7BA8CE71F8FE4817E1A47B4A290BFB43C90FF64D0EBA9D67543EB311B947FC6E5A0FCA0FC11CD80012D250302E587D941F9617350FEAC9A7D5194BF5605E5A7DE3603E507E507E507E507E527E83F2EE597013DC0FC898603E607E60F6B4D63FEF24645BA3EBFB8B960CC3FED33E6C4F9255CD18A82FEF2A241BFBBB38E1FB37CD4D825E03EE03EE03ED08F64F8B22CE807701F6607DC87CD01F7B36AF6D4705FF2A0DA4A191BED506F9B01EE03EE03EE03EE03EE13F41F6BA31DD31BB31744B803A09F68AC9C037DF9ED76362AF339AC96B205CE82B6DBA9AC9D6D6D54E5817E6D7D21407FB73BBAF94DF9FAC3E8F64FCA158D21C722FC90C3A165035694DC57164DEE9B8EB17FBAD36E83D983D983D983E8484628CB4274C0EC6176307BD81CCC3EAB664FCDEC716E2D983D987DD49380D983D9D3C61C98FD92337B11AC035A9F68A60CD1FA7BAF2B516C9F873AFC856C925F2AD626E165F5E9987DA33BFCB9A7F446B77FD6E479BD80B359514C5F5D0A4CCF5D0173C8712D483D483D483D384EA2FA92E23B90FA3C9A1DA43E7F3607A9CFA4D99F98D4DF9D625B01A8A7DE3603A807A807A807A807A827E83F1AA8A7831DB0FA444B81D583D5476A85587D79ED6CAB561385F57711667D21ACFE6CF88BAA3447B7FF9E92D493BDCD8AC2FAF5B9C0FAD79639E853EE5C6D3659DBBB3A347567205DEF52DFABDAC293751C7F5EBA6EB4C35B32E84174F0FAE40199E1D8A79AD3E54F19DC8744342D086B883E236A1ECF253D419832FEDBD4C3EDA2EBB97DD72A9AC55AFEF875178F0DF3D8751014BFE48D37FF5166BC3A66DC6EF2CC99AD2F9239F14660282878A933C377C642C35060D85EF1F540FB9DB1670EB81E5FF5B6CEE9F3C55716F8B4A0037D9BF8F1E9CC1022CAD57397F09EF7EAAE6EDAECE5C0715CC3084DF034A9BBB92C95D3648A2631AAE7E900F7EEFBB28CC0BD9881E70D9C7B76A72FD19062C4187DEC318A1423CC8E1463FE6C8E28249366974A9978E1897CCE8407D39AA1798DDE57532E547DC0AF29CE069B7E9243AC153AA39AECEA5C164C83FA4B257FBD22CC25C2CAFE083A32AD1E69C574C0543E637C555B6625EBD9D31B4485ED43A3CB2CCD61945AD414D8F23EAE6A981450347148C1FA507208FAFD054F16ABBA929E2CCECE3B2D47BBA00E15587BC5ADCDBD900FC760EF5CD8FBC0741A16EF35583CFB16F791B0FB20B075B66C2D14FCA5597DA06443D6E6F216A7A580DDC9ED2DBC68EB0754244636868AC4B8FB4045222A1223F41FA322B1AF77F64F77CD5E4F359E7AFB8060AA48C7471F6CE692997133336C417B472CF5DB36FCA4B21D76CAEFFDD452F9B873FF4CD355F97CF33F79B166CA7A4921AD077B1B54D63E6DD52BF5272B78DCED8E6EFFD2528CAFDF1B1DC531875F0CB7FCF14F4A6FF8E3B5D2EA8E6E7EEA29ADE1AF4647BE2052D0D93D5A4524ADB2B1B6E86D080E7BDEC98AFE7FDC83154FA867BC6247024AFBD891003B1250420B609C5835940BC1EC281782CDD34D75940B65D1EC84C064B223817C25CDC3DD83C5DBC0A604D894002980E487400A20EA22A400900248910290C73CD89F20D1681942DE82F414DB13CCD29AD756C2E2B1E67C687DB4D3A09DDE1743E7A5FDD08AEE5CB0B168BEEFED0F71CC6C30FDD8CBC1F4C1F4239A01F1594AE203A60FB383E9C3E660FA5935BB10D3C72EC3B904FA429B2F81E883E8937B08441F447FFA939791E88B811D50FC44436588E26397E1B83E4A89F12B6B675BE5A2F036C313905F5B08C87F33FCD253F4D1CD8F698F04A4FA9B15A5F5F5A5A0F527EA058E048CBB1CB01EB03EA219A09CA5443980F5303B603D6C0E589F55B32F08D6D74A80F5D4DB6680F580F580F580F580F514FD4783F554AE03569F6827B07AB0FA48ADF995DC2F88D4FFE3EF83948C9EE8665614D16F2E01A2F7BFBD00440F440F440F802319952C0BC001A287D981E8617320FAAC9A7D41887E7313889E7ADB6CD1881E1BE480D04FAB80D083D0CFF01A9923F474AC03429F6827107A10FA48ADA96AFA5AA92ECBE86B65D120753E8CFEA83BBAF95B5FB9187E3153A17AB2BF594D545F2ECE05D57BA76B51EE5C6D3659DBBB3A347967205DEF52DFAFDAC2D3751C7F5EBA8EB4C35B32E84174F0FAE40199E1D8A79AD3E54F19DC8744342D086B885E236A36CD253D419830FEFBD4C3EDA2EBB97DD72A9AC55AFEF875178F0DF3D8751014CFE48D37FF5166BC3C66DCAECC59C7617D91CC8937024361C14B9D19BE3B161A8602C3D63B10FA9DB1670EB81E5FF5B6CE454F9316F8B4A0037D9BF8F1E9CC2022CAD507A7B8EDEAA6CDFCD3A80527789AD4DD5C96CA69324553071402EEDDF76519817B3103CF1B38F7EC4E5FA221C58831FAD863142946981D29C6FCD91C514826CD2E953249736EF6315FE7B1CF9AA1DD9D963951532E547DC0AF29CE469B7E9243AC153AA4AA0690AA54AED4052995BF56F2172CC26022ACEC0FA123D3EA91964C074CE553C657B56596B29E41BD5154D83E34BACCD21C46DD455C925CDEE7550D93428A261E2958204A8E41BFBF72E7CACACFD6B3EDCCE22CBDD372B40BEA6081BD57DEDEDC13F9840C16CF89C50F4CA761F17E83CDF360739F0DBB0F026B67CDDA4261609A85C8AAD56FC45B3E95DDA5AC2E6F735A3ED89DE0DE2A8CB6964079626463284F8CBB0F9427A23C3142FF31CA13FB7AE70F2207B3CDB34431982BD241D2079BB99866DCCC0C63D05E124BFDC20D3FA96C879DF27B3FB5543EF0DC3FD374158A379FA4783365FDA490D6831D0E2A6B9FB636EAD5272B7F745DD1E7CB96EF8A9E5F503A35A60652D4A93D5A1D24AD9EB1B4E8AD075AE7CD57576ECDE809EB73E7EEB07D4DC74EC17197631B8284E017DB10AC12B2C97806393184458D501ECD8E1AA1FCD91C354299343B213099B90D4199F2EDB2C93604E36F89956A1B826D601F02EC4300D09FFC1000FD511701F403F4A700FD7A5397633CD89320D166C0DAF9D993A0C4C785FF23CBD4EB354AB0F8A0DCBB16DAF6AAFC749B1244FA8DE71F8FE4E9BCAC275AD1DD0ACA8BA6FBED76F3B8EF3458AFAFF3CEA63C3EB83EA97D707D707D4AD802EA13AB06AE0FB383EBC3E6E0FA30BBC4CA7536D72F0B71FDF1F6C2E5BA6013C0FAC0FAC0FAC90F01AC1F7511B03EB07E0AAC2F017700F413AD05A00FA01FA91502FAD5B5B3AD52B5B629BACBF038CE5C2F2E84E7BBB05DE98D6EFE6BA018FE7EC34667F8ABC1FF1CDDFEB73CD417F7432B8AF32B8BC6F94DC7F0D327CFFCFFFC61C7E193A5EDCE97B7FCBA2EF83EF83EF83EE88F6434B32CF4077C1F6607DF87CDC1F7B36AF6B47CBF4209E422EAF6AB25C13600F801F801F8931F02803FEA22007E00FE1480FFAE5A3605EE01F14F341F883F887FA4D6D4B182F5CD0DD96305CBD58A60E039E70AFE180F329F627E79F7B4A28980EAA21301ADF3E68B8F1ABB7C6F994DEF89DE334B33499BB8C5F27F91E98F0400120089EE1C0900E0212400607624006073699B23019049B3A74D00C86EDCB359C6C63DD4DB66480020018004001200480010F41F2901F0E2426397FD31E6E993310FB87FA2D5C0FDC1FD23B522B7EE295749146F2ADEAC2FA6D23FC671A4C5FDF26D2E3BE8BFF7EBB7DF9C39967AC21F4FD5B93DADED7F8240201008040281402010080402814020100804028140201008040281402010080402814020100804028140201008040281402010080402814020100804028140201008040281402010080402814020100804028140201008040281402010080402814020100804028140201041F97FCE1C7ABBE0FF0200 as [LayoutDataConfig],N'Col1&ViewHTML' as [ColumnDataType],N'' as [ProcBeforeSave],N'' as [ProcAfterSave],N'False' as [IsLayoutParam],N'' as [ColumnSearch],N'False' as [AlwaysReloadColumn],N'False' as [NotReloadAfterSave],N'' as [ColumnChangeEventProc],N'' as [RowFontStyle],N'True' as [isWrapHeader],N'' as [ContextMenuIDs],N'' as [ColumnNotLock],N'ImportTimeSheet' as [Import],N'' as [ProcBeforeDelete],N'' as [ProcAfterDelete],0x1F8B08000000000004007D8FB10AC24010447BC17F38D6564CAECF052BB1B032106D97B898C34BEED8EC45E2AF59F849FE82C1602188DD30CC1B669EF7477614C682D8A2B33762D51377D6B706F42A058521385BA1BC9DD2D215F2F94CA92CB00FC432A8161B32B0D8E1E0A394130B2AF9972A2A74B4C14A3C43BED6CB833D496DF4A8B664CFB5189D251FF267CFC67383B28F8E3A50B6BBD060403812A81E5D1C03E9B4204BBEBFE52FA791B64FEF000000 as [ConditionFormatting],N'True' as [ViewGridInShowLayout],N'' as [ShortcutsControl],N'' as [LblMessage],N'IOHrsFIX&63,UnpaidLeaveFIX&63,PaidLeaveHrsFIX&73,WorkHoursFIX&74,TotalPaidDaysFIX&79,Actual_WorkingDaysFIX&79,STD_WorkingDaysFIX&63,ProbationEndDateFIX&105,PositionNameFIX&98,HireDateFIX&76,DepartmentNameFIX&134,FullNameFIX&180,EmployeeIDFIX&73,STTFIX&47,DepartmentNameFIX&134' as [MinWidthColumn],N'True' as [IsLayoutCommandButton],NULL as [LayoutDataConfigCrazy],N'' as [NavigatorProcedure],N'' as [ValidateRowConditions],N'' as [ExecuteProcBeforeLoadData],NULL as [LayoutDataConfigWeb],0x1F8B0800000000000400ED9D4B72DBC81980B34E55EE8062AAB2626C91D47366A4926C59B6AAFC2A8933B69710D1925006D12C107A799B0BE408C93A39C1CC621633179913E40A69009444C900F103944512F8BE7252231B7FE3F1371A8DAF1BADFFFDF2EB0F1FC3C03E54816B7BEE171558E72A18BADADF6CB49E2C352C7B30F0DC9E1DC67FF3FC6C18EAFE6BFB4A9F85CFB51F06DA6B6CFDE5CF96F5C320D003158457966FF7D566E3AFC9363F254535ACA7A95BBD1B44C50EF774EF6CD8B0DCA17FE6799B8D303853D14F9FD5D5E88738F8EBF09D5EE89EDBA13A549EEA85CA191DD13BFFA50E9332B7A2F01F9E5EC76595E379FA220EB829E1B57DA4BCE7E6C43F37B68E6D6F985FC80BDF3EF2D4CE59A8BBF6D1BBC05141F9BD5F9F98638A7A6F9F28E931DC16F532D06783E2E76FF677A49C92C107CA76B4EF5DBD70DC5007D2F837FA5C25E1EEC969D8D5AFD571283DDF9BD85D37303520AA695B3BBD400F87DD53E5EFEA0BFF5E11F77FBC57DE6BAD3FEFF8CE9E525E89EA78F8D9F5DF9AFF6A6CEDAAF3179783400D87D66178E5E59F48BC55632B2A2177DB1F876A571DDB675E387EB8B28B6D623FB8BEA32F861FDF9B4BD4CFA8593997693F54FDE1DD4B629DDBDE99F9A7D67AD6D589825A82ABFA7564F76AA092EB9A342A71F5FCEA5453E26E2BF37B3B507E1817326A8AD202E24D9FE9E8DE1DFEE40EDD232FF3CECBB80F7603FBE299DDFB7C624AF29D8CA464B51DFBBE630E72F8C10D4FCD598E8EA3B1D59595316A4BA3CBDC5597A1E84AA75C3313DAD5A38668D71D86B6DF33019D9403480FDEF1DC13FF8D764C90A96CC9751F1D5ADA49E49FD7733B8EDEEF9B76F02629C2EBBA17A5E4B669889A96AE8EDB19417052D99253395027679E1D143CDCD73A796E460D427CC3168C8F2AC46563EBEF2D69F54BEACC73EDE9E099A77CC7F54FE41538A984052AEDE5C0F69D77A6993D3371139F9559C105F676DDE4C549895A84C696E95C84A667E209A20F4FF5C5E859FADCD343F5EC2C0CA3BC14BAB95F857DEF300CCC45DDF74769121F7E5CC04BEF6A701AB5F17E9C1879A518DD40EFCDBECBDED83B8381B283E86E8E5BB9EBE39715967267E940C5F56CBC3D4DDB70AC4AE66E6A1ACE621BB6F3B6DC330D9979ACAA13ADAC1FF79BD6FA939541DA054F8B7D19D88E6B5AAFA40578A503F78B292DB5BA65EDFAD0F4A7779517DA8DADA52261516F601497DDF2A4B69E19352FAE3977129F5571C58F84D45669D2EE0BECF2B6B2468F332A69F52BE99D845FBF59D62CEFADA57AA7BD40B7959C5724E7F443AA997779A7B61BBD758CBDD897ECDF1E98373D75ECFA6E5C68BA9C58BA9BA6AF5EBDB477D6F78B952279F73017BFB1B5BDDCFCE03AE1E9666BB5B3BCDD69BE52D16BE8E6C6F2BAF86D297969292C26C683933AF456077DD16BD32B659B9B26091D96799B8D333A925BFBFEA90ADC5039127593DEE74CABBC69A1B787DAD5125374DB265D0BD7729530B95E3466D9B10BD99865253AD6F4D2BA42BA173DDDA61D4A0C1909AF47C25FE9B01B98CB46CA6B90F2C40D472742B22B96EC423DC0695E42322A8038FDC2E44B535F3EF153A5BD54D2CBA75C36121CDDDEF10B98EC2D62F4729ACC7771BFD8052445AA01DF0DEC89233E99617A30F17DABCC6B7601A79EF2963D1A949465D16C7F68DE3E1B5BB2C182E40DBCD01E9290EC9D14B8425A7B5DB7ECAD7F133DE9061C6DD475434F89B6DCEF693F19EC7CAB7DD9D8C97EBFAF1CD70ED5F511658A828C3A773BCC59ACC2C6C72AB90A631B0AAEC4D8D625AEC66866C5D8A1C947A1A2A869AE66145FE08A0A6AEA5B3B9A0573A0B5C4BD4C235A17FCC19669D52BF65C934D6B8A8C58616B685AD45E5C61979AD6E88FE8801CA778D4ADAEDB6E353F6E2E99FFFFB429098CA675ECFB771ED2A6A6F6C5B332E211279382A11BCDBCB2CCC14773F624B374EEEF3229493251E730B483F0ADBA78EDFA05D211E7CFF5DCF0AAB1B5E35DD8575F1F65EEE4BFA819683FC80CBC91988D0A945CAC64EBA48093C089BB22C924D1C7987A736F565A344337BA6B85E6DE1CFC300C6CD70F87C9A3472EBFE3395CF7AF77F66D5A78CA571C109F593F7A6BDD7AE33A8EE9E3A963F1C1757574716EFDFA8AE4A29C9F143CB1EB88D140486B341012DDE6A35190023DF269E640319345F00CC62C309365DABCD77D56033359EA977366B25433EF82AEC91BFBF2DE248FCEFA72BB58F7E68DEB8FCA688FCA68B7CD7F8E4A68B7E5FDECB11E61570F84DDC128D68414FDC0E295393A2F3AC2F82B2CE5C49D9C025DE46EE0F69341979D40D9377D33F1FEAF0FDBFCD5D86917F8DA22893755F14BA9F8A2DF4C3CC8670048E9BB8521A5B38E03298D944E89FF1652DA3BF20A7A1DF4746EB2AAA3A7A58316A55C7514349D5C9A62BEE994A2BC65AA43F2A78C286F373F6DAEA47D9C9BA632332721AF6E6C3C9A6CFF9B177EDF8BEE196BD3EA99DEDF50FB7F3B09BFB7F68F2DD30DB07AA7B67FA2ACF0D4FC2F6A869B562FFAB0D4D2BE655BBEBAB03CD737FFA423576FB9E113AB6BB654C7C72A9E8A6939A651B47AB6EFEBD03A32FFE044F38D9BD6505BEE715CE8BD4DDDA1751168FFA46939CA5361B2E3F86FE21D35A39FFD785F77F7DED341F455F1132B3A9DA7F1F94467517EE4A070F3F9CD8611D213973FF95B34FCD099F5F043EFE872FB93127DC9CDC003030F0C3C60A5E6D24A31F0808466E0819C33F050D9BC971F78B81D36582D35F2B052B408461E187960E421FF24187948DB889107461EA61B79D8BE122A1DC61C72D3C49803630EE35163630E9DE6C7CDF5D69A7C7A7E727D3AA3EB138516EB573ECC9083D0F76698F9B7BFFFA3FF5D6585FC322BF2A6C64E5C91B770BFF9DB2CCA9B26CD734721589497457927074FB728EFC40E435AFBCEB2BC2CCBDB6A575DE665543DD6E5A596CE772D65549111264615EB97737A22154D7CA931921AAECCDBDA90182A56E665655E5AB3797A8CD57969DEFAE6BBAE6BF3D637E3F55D9CB78E39AFEFEABCD5CF76A16E608D96E79D90F9A9F25E2AEBE5732E1B17667D5E2624E65C2126243221F1FE9EE77142E2C03BD9FBF05CF7FBB62F312A4C4AACFCF3EDB12625CE74D1DE4EF3D3E6DA8A64A1AA795BB6B7E00D3BDB157C5766FD09FD51E8EF7DD871444DDB037F422F99BC763F597C4A9F7251F8949E592F99875937FF90DB2563D64B1DD3CEAC97FAE59C592F154DBCA07392FA31FDEAED174BCBE596F1DD285A041FD3F3313DEE3AFF2470D7691BE1AE71D753B8EB2272076F9D9BA60A79EB8292B4761FD5779AD6E84F1979FE109FD48B7A970FE3DE4D0B11AD875B5EB917686716F3C3FAD5B9D0F487F6F9A37C478BA7CF0DC6D3E3E9713878FA874F7CCD9D2D9EBE7E39C7D35734F1B3F3F46B6D3CBDF4B0D5AC3D7DA1058210F5887AF11542D423EAEFEF796E45BD54EF60EA73F384A9C7D4A7457DA3E56F1FD1D50B1B8949A25E58C4629AFAB5B930F5BBF1EF1FC4D5E3EA71F5789CD23D9379F138B87ABC2DAE9E9CE3EAAB9BF8D9B9FA755CBDF8B0D5AC5D3D73EA51F5F74350F5A8FA09AD460555BDDCEF20EB733385AC47D6A7457D35ADBEDDFC2454EDF3E1EAC5ADC4245B2F2E64317DFDFA5CF8FA033554928E29BA5E543EBA1E5D2FE991A0722684A1EB1F3AF13557B7E8FAFAE51C5D5FD1C4CF4ED7AF157D9942D733B51E5F2F38097C7DDA46F87A7CFDB4BE5EEC77D0F5B98942D7A3EBD3A252E6D62F9AB0973613937CBDB48CC5D4F51B73A0EB5F5C0E7480ADCFDA1C5B8FAD4F290693931B3EA70A0F5B5FC7B463EBEB97736C7D4513FFF8B6FEFA55AAD56176BDF8B0D5AC753DB3EBB1F5F743B0F5D8FA09AD46E56CBD5CEF20EB73F384AC47D6A745A5CEAD5F2FA0EAAF3BA9ADD5CEF24C5C7DD24C58A1B6D4654FA55568B9B51737398B29ED5B4B7360EDF7FB58FB099B63EDB1F629C52CA8D159AFBAD041DA237091F6E4BCBED2BEF24D7C59673FE6DB3BABE59C7D6BA96019387B9C3DCE3EFF2470F6691BE1EC71F6D3397BB9DCC1D9E7E609675F1B67DF32D522F953C6D9779A9F365BAB534B7B510FF361A4BDB89DC876F5E22216D4D5B766EDEA1DE7E8601076557FE099E78CE4F431F6A2F231F6187B49BF049D931D86B17FE0BCD7DDDE62ECEB97738C7D35F35ED6D83FC42CFB16B3ECA587AD30F6187B8C3DC61E632F88FF16C6BE84E2C1DBE7660B6F5F1B6F3FDD5CFBD8DBB71769B2FD4B155A8978B7AE5B0D6BCFF5A658DBBE7813B4A03EBF3D6B9FDF3BBADC7E63FEE27406267FE72CD4511DC6E063F031F8E81D0CFEC3E7BDEE3617835FBF9C63F0AB99F7B2067F6CCE7DBBD89CFBEB55ED578A1681C047E023F0F34F02819FB611021F813F85C0F78EBCEDBED4E9A0EE73F35421757FA0B5A82F5037653FDD54FB56F393E8FC262D642FEA563E8CAF97FADE0C39DF3DFDEDDFFEC977D595F29D594BF9F032DC73BD50A5DEF0931FC94879A43C523E73438CCD7C993AA47C1DD38E94AF5FCE91F2D5CC3B527E5218521E295FE69641CA4BAF10521E297F7FCF732AE5E54E07299F9B27A43C527E3C2AE317CCCAB4FA242FBFF6685EFED0DCF4BD69C4FC6FFFED5B9FDD3F7EFE55629C1754CE2FCF5ACE1F85FE81F2B42DF9F405398F9C47CE636EE6D2DC20E711B5C879728E9CAF6CDECBCBF9E59BF79FD66ABB949E5F5B2DF812859E47CFA3E7F34F023D9FB6117A1E3D3F9D9E975B1DF47C6E9ED0F3E8F9F1A8D45F29BB4872FE400D5DC7D409CB9C7EA08612ED9DA1E98B34350B2AE957662DE97B9F8F925FDB7BA806A6A90E95703D2216AB17958FB847DC4B7A2733B23AED8A6B1DCC3D1617734FCEEB6CEEABDEC69757F7B76F4792F5475396AB5F5D2A5806E61E738FB9CF3F09CC7DDA46987BCCFD74E6BE9CEAC1E2E7E6AC4216FFCEB30B9DFFD03A3F5AB57E6545A4E3EFAD5ADFEE8C7737253B7F18A16FDA0D15B71BC351BB716CDA8DEF94A46E648BFD522DD1824AFED53990FCDBC93755CFAE76CDE53EB0FD13247FD6E6487E247F4A310B2A806AEFFD50FC754C3B8ABF7E39AFA9E2AF7ADA6729F85711FCD2C356087E043F821FC18FE017C47FABE5EC8F63CD7374E598430BA49A07C19F9B33043F823F352A75BE7EA7CC22F7EB63BF94B6F3A87AFFEB56635ABD9F52E2B9A4C40535FC6BB336FC4E38D8DE0B743FB2FB887DC43E621FED53B2F3322FDA07B14FDA11FBE41CB15FD5B49713FB1B4BCBA557C4BF11FB2B2B2C892F3D6C85D847EC23F611FB887D41FC3713FB81EE3B42BB83CFCF4D153EBF505F644CE7DFFC56A18DDB2E546BA3BCD0974CAB98E5FAF8B1962FABF4D766A2F40F5D7365CBFBFBEE1FBFFCC7F24F7EFBD755758DFDFA3C18FBAEC6D74FD81C5F8FAF4F29069B339736075F4FDAF1F5E41C5F5FD5B4E3EB2786E1EBF1F565EE197CBDF40AE1EBF1F5F7F73CAFBE3ED4D87A6C3DB6FEF16CFD72F3E3666B6DADB57033F0BBD2A622C3D7FFFECF3F7EFED5AF8CB1BFF3E30F4F3F86817DA802D7F64CB682AD3F010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000406DF83F31A27AECE0FF0200 as [LayoutDataConfigMobile],N'' as [GridBandConfig],N'' as [ControlStateProcedure],N'' as [ValidationProcedures],N'' as [ReadonlyCellCondition],N'' as [ComboboxColumn_BackupForTransfer],N'False' as [IsOpenSubForm],N'' as [Validation],N'btnFWAdd,btnFWDelete,btnFWReset,btnFWSave,btnImport,ckbExportSeparateFile,ddbRptTemplates,btnExport.Export_AttandanceMonth,ckb@ViewProbationPeriod' as [ControlHiddenInShowLayout],N'True' as [IgnoreColumnOrder],N'False' as [IgnoreLock],N'' as [ReadonlyCellCondition_Backup],N'' as [SubDataSettingNames],N'False' as [IsViewReportForm],N'True' as [ExportSeparateButton],N'' as [HashLayoutConfig],NULL as [LayoutDataConfigFillter],NULL as [LayoutParamConfig],N'' as [OpenFormLink],N'' as [SaveTableByBulk],N'False' as [IsNotPaintSaturday],N'False' as [IsNotPaintSunday],N'False' as [IsViewWeekName],N'False' as [IgnoreCheckEECode],N'0' as [ParadiseCommand],N'' as [Labels],N'' as [ColumnHideExport],N'False' as [ColumnWidthCalcData],N'False' as [HideHeaderFilterButton],N'False' as [HideColumnGrid],N'0' as [TypeGrid],N'' as [ProcBeforeAdd],N'' as [ProcAfterAdd],N'' as [ExecuteProcAfterLoadData],NULL as [LayoutDataConfigColumnView],NULL as [LayoutDataConfigCardView],N'0' as [HideFooter],N'False' as [IsFilterBox],N'False' as [GetDefaultParamFromDB],N'0' as [TaskTimeLine],N'0' as [HtmlCell],N'0' as [MinPageSizeGrid],N'0' as [ClickHereToAddNew],N'False' as [IgnoreQuestion],N'0' as [FormLayoutJS],N'0' as [CheckBoxText],N'' as [ColumnHideMobile],NULL as [LayoutMobileLocalConfig],N'0' as [ViewMode],N'0' as [Mode],N'' as [Template],N'0' as [NotResizeImage],N'0' as [DeleteOneRowReloadData],N'False' as [AutoHeightGrid],N'' as [ProcFileName],N'0' as [HeightImagePercentHeightFont],N'' as [ColumnMinWidthPercent],N'0' as [GridViewAutoAddRow],N'0' as [GridViewNewItemRowPosition],N'0' as [LastColumnRemainingWidth],N'False' as [IsAutoSave],N'' as [VirtualColumn],N'0' as [GridTypeview],N'0' as [selectionMode],N'0' as [deleteMode],N'0' as [ClearDataBeforeLoadData],N'False' as [LockSort],N'' as [HightLightControlProc],N'' as [ScriptInit0],N'' as [ScriptInit1],N'' as [ScriptInit2],N'' as [ScriptInit3],N'' as [ScriptInit4],N'' as [ScriptInit5],N'' as [ScriptInit6],N'' as [ScriptInit7],N'' as [ScriptInit8],N'' as [ScriptInit9],N'0' as [FontSizeZoom0],N'0' as [FontSizeZoom1],N'0' as [FontSizeZoom2],N'0' as [FontSizeZoom3],N'0' as [FontSizeZoom4],N'0' as [FontSizeZoom5],N'0' as [FontSizeZoom6],N'0' as [FontSizeZoom7],N'0' as [FontSizeZoom8],N'0' as [FontSizeZoom9],N'False' as [NotBuildForm],N'False' as [NotUseCancelButton],N'4' as [GridUICompact],N'' as [DisableFilterColumns],N'0' as [DisableFilterAll]
+
+EXEC sp_SaveData  @TableNameTmp = '#tblDataSetting' , @TableName = 'tblDataSetting' , @Command = 'insert,update' , @IsDropTableTmp =0,@IsPrint=0
+IF OBJECT_ID('tempdb..#tblDataSetting') IS NOT NULL DROP TABLE #tblDataSetting
+--#endregion _
+GO
+
+--#region tblDataSettingLayout
+IF OBJECT_ID('tempdb..#tblDataSettingLayout') IS NOT NULL DROP TABLE #tblDataSettingLayout
+  create table #tblDataSettingLayout (
+   [TableName] [nvarchar](MAX) NULL 
+ , [Name] [nvarchar](MAX) NULL 
+ , [ControlName] [nvarchar](MAX) NULL 
+ , [NamePa] [nvarchar](MAX) NULL 
+ , [TabbedGroupParentName] [nvarchar](MAX) NULL 
+ , [Type] [nvarchar](MAX) NULL 
+ , [Lx] [int] NULL 
+ , [Ly] [int] NULL 
+ , [Sx] [int] NULL 
+ , [Sy] [int] NULL 
+ , [ShowCaption] [int] NULL 
+ , [Padding] [int] NULL 
+ , [TextLocation] [nvarchar](MAX) NULL 
+ , [GroupBordersVisible] [int] NULL 
+ , [TypeLayout] [nvarchar](MAX) NULL 
+ , [Spacing] [int] NULL 
+ , [BackColor] [nvarchar](MAX) NULL 
+ , [ControlType] [nvarchar](MAX) NULL 
+ , [ColumnSpan] [int] NULL 
+ , [RowSpan] [int] NULL 
+ , [CaptionHorizontalAlign] [nvarchar](MAX) NULL 
+ , [CaptionVerticalAlign] [nvarchar](MAX) NULL 
+ , [WidthPercentage] [int] NULL 
+ , [FixMinSize] [bit] NULL 
+ , [AlignContent] [nvarchar](MAX) NULL 
+ , [BorderBottomColor] [nvarchar](MAX) NULL 
+ , [BorderBottomSize] [nvarchar](MAX) NULL 
+ , [BorderColor] [nvarchar](MAX) NULL 
+ , [BorderLeftColor] [nvarchar](MAX) NULL 
+ , [BorderLeftSize] [nvarchar](MAX) NULL 
+ , [BorderRightColor] [nvarchar](MAX) NULL 
+ , [BorderRightSize] [nvarchar](MAX) NULL 
+ , [BorderSize] [nvarchar](MAX) NULL 
+ , [BorderTopColor] [nvarchar](MAX) NULL 
+ , [BorderTopSize] [nvarchar](MAX) NULL 
+ , [BorderVisible] [bit] NULL 
+ , [ControlBackColor] [nvarchar](MAX) NULL 
+ , [ControlBorderBottomColor] [nvarchar](MAX) NULL 
+ , [ControlBorderBottomSize] [nvarchar](MAX) NULL 
+ , [ControlBorderColor] [nvarchar](MAX) NULL 
+ , [ControlBorderLeftColor] [nvarchar](MAX) NULL 
+ , [ControlBorderLeftSize] [nvarchar](MAX) NULL 
+ , [ControlBorderRightColor] [nvarchar](MAX) NULL 
+ , [ControlBorderRightSize] [nvarchar](MAX) NULL 
+ , [ControlBorderSize] [nvarchar](MAX) NULL 
+ , [ControlBorderTopColor] [nvarchar](MAX) NULL 
+ , [ControlBorderTopSize] [nvarchar](MAX) NULL 
+ , [ControlForeColor] [nvarchar](MAX) NULL 
+ , [ControlHorizontalAlign] [nvarchar](MAX) NULL 
+ , [ControlPadding] [int] NULL 
+ , [ControlVerticalAlign] [nvarchar](MAX) NULL 
+ , [FontSize] [nvarchar](MAX) NULL 
+ , [IconName] [nvarchar](MAX) NULL 
+ , [ItemBackColor] [nvarchar](MAX) NULL 
+ , [ItemBorderBottomColor] [nvarchar](MAX) NULL 
+ , [ItemBorderBottomSize] [nvarchar](MAX) NULL 
+ , [ItemBorderColor] [nvarchar](MAX) NULL 
+ , [ItemBorderLeftColor] [nvarchar](MAX) NULL 
+ , [ItemBorderLeftSize] [nvarchar](MAX) NULL 
+ , [ItemBorderRightColor] [nvarchar](MAX) NULL 
+ , [ItemBorderRightSize] [nvarchar](MAX) NULL 
+ , [ItemBorderSize] [nvarchar](MAX) NULL 
+ , [ItemBorderTopColor] [nvarchar](MAX) NULL 
+ , [ItemBorderTopSize] [nvarchar](MAX) NULL 
+ , [ItemForeColor] [nvarchar](MAX) NULL 
+ , [ItemPadding] [int] NULL 
+ , [MinGridPageSize] [int] NULL 
+ , [NotClientVisible] [bit] NULL 
+ , [NullTextMessageID] [nvarchar](MAX) NULL 
+ , [FullPageEmpty] [bit] NULL 
+ , [PaddingTop] [int] NULL 
+ , [PaddingLeft] [int] NULL 
+ , [PaddingBottom] [int] NULL 
+ , [PaddingRight] [int] NULL 
+ , [ControlCellPadding] [int] NULL 
+ , [MaxWidth] [float] NULL 
+ , [MinWidth] [float] NULL 
+ , [TabPageOrder] [int] NULL 
+ , [SelectedTabPageIndex] [int] NULL 
+ , [FixWidthClient] [int] NULL 
+ , [ErrorMessage] [nvarchar](MAX) NULL 
+ , [borderRadius] [nvarchar](MAX) NULL 
+ , [boxShadow] [nvarchar](MAX) NULL 
+ , [IsValidation] [bit] NULL 
+ , [HorizontalAlign] [nvarchar](MAX) NULL 
+ , [maxHeight] [int] NULL 
+ , [TextAlignMode] [int] NULL 
+ , [minHeight] [int] NULL 
+ , [HeightPercentageClient] [float] NULL 
+ , [ControlBorderRadius] [nvarchar](MAX) NULL 
+ , [ControlBoxShadow] [nvarchar](MAX) NULL 
+ , [ControlPaddingBottom] [float] NULL 
+ , [ControlPaddingLeft] [float] NULL 
+ , [ControlPaddingRight] [float] NULL 
+ , [ControlPaddingTop] [float] NULL 
+ , [ForeColor] [nvarchar](MAX) NULL 
+ , [CaptionWrap] [int] NULL 
+ , [LocationID] [int] NULL 
+ , [ContainerType] [int] NULL 
+ , [ControlNoBorder] [bit] NULL 
+ , [BackgroundImage] varbinary(max) NULL 
+ , [labelMode] [int] NULL 
+ , [selectionMode] [int] NULL 
+ , [deleteMode] [int] NULL 
+)
+
+ INSERT INTO #tblDataSettingLayout([TableName],[Name],[ControlName],[NamePa],[TabbedGroupParentName],[Type],[Lx],[Ly],[Sx],[Sy],[ShowCaption],[Padding],[TextLocation],[GroupBordersVisible],[TypeLayout],[Spacing],[BackColor],[ControlType],[ColumnSpan],[RowSpan],[CaptionHorizontalAlign],[CaptionVerticalAlign],[WidthPercentage],[FixMinSize],[AlignContent],[BorderBottomColor],[BorderBottomSize],[BorderColor],[BorderLeftColor],[BorderLeftSize],[BorderRightColor],[BorderRightSize],[BorderSize],[BorderTopColor],[BorderTopSize],[BorderVisible],[ControlBackColor],[ControlBorderBottomColor],[ControlBorderBottomSize],[ControlBorderColor],[ControlBorderLeftColor],[ControlBorderLeftSize],[ControlBorderRightColor],[ControlBorderRightSize],[ControlBorderSize],[ControlBorderTopColor],[ControlBorderTopSize],[ControlForeColor],[ControlHorizontalAlign],[ControlPadding],[ControlVerticalAlign],[FontSize],[IconName],[ItemBackColor],[ItemBorderBottomColor],[ItemBorderBottomSize],[ItemBorderColor],[ItemBorderLeftColor],[ItemBorderLeftSize],[ItemBorderRightColor],[ItemBorderRightSize],[ItemBorderSize],[ItemBorderTopColor],[ItemBorderTopSize],[ItemForeColor],[ItemPadding],[MinGridPageSize],[NotClientVisible],[NullTextMessageID],[FullPageEmpty],[PaddingTop],[PaddingLeft],[PaddingBottom],[PaddingRight],[ControlCellPadding],[MaxWidth],[MinWidth],[TabPageOrder],[SelectedTabPageIndex],[FixWidthClient],[ErrorMessage],[borderRadius],[boxShadow],[IsValidation],[HorizontalAlign],[maxHeight],[TextAlignMode],[minHeight],[HeightPercentageClient],[ControlBorderRadius],[ControlBoxShadow],[ControlPaddingBottom],[ControlPaddingLeft],[ControlPaddingRight],[ControlPaddingTop],[ForeColor],[CaptionWrap],[LocationID],[ContainerType],[ControlNoBorder],[BackgroundImage],[labelMode],[selectionMode],[deleteMode])
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnexport' as [Name],N'btnexport' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'3' as [Lx],N'1900' as [Ly],N'3542' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#336633' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'Export' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnfwadd' as [Name],N'btnfwadd' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'3' as [Lx],N'1820' as [Ly],N'1771' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#339933' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'AddNew' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnfwdelete' as [Name],N'btnfwdelete' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'3' as [Lx],N'1860' as [Ly],N'1771' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleButton_FWDelete' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#E94235' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'Delete' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnfwreset' as [Name],N'btnfwreset' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1774' as [Lx],N'1860' as [Ly],N'1771' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#FFC000' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'refresh' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnfwsave' as [Name],N'btnfwsave' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1774' as [Lx],N'1820' as [Ly],N'1771' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#25205E' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'Save' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'btnimport' as [Name],N'btnimport' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1' as [Lx],N'1978' as [Ly],N'3542' as [Sx],N'36' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#336633' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'ImportFile' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'ddbrpttemplates' as [Name],N'ddbrpttemplates' as [ControlName],N'plgfwcommand' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'3' as [Lx],N'1940' as [Ly],N'3542' as [Sx],N'40' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'DropDownButton_VTS' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lbl@month' as [Name],N'cbx@month' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1' as [Lx],N'1' as [Ly],N'1771' as [Sx],N'26' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SearchLookUpEdit_VTS' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'1' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lbl@year' as [Name],N'cbx@year' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1772' as [Lx],N'1' as [Ly],N'1771' as [Sx],N'26' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SearchLookUpEdit_VTS' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'1' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lblfilter' as [Name],N'txtfilter' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1772' as [Lx],N'27' as [Ly],N'1771' as [Sx],N'27' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'PopupContainerEdit' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'1' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lblreload' as [Name],N'btnreload' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1' as [Lx],N'27' as [Ly],N'1771' as [Sx],N'27' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'ParadiseSimpleButtonBase' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'50' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#339933' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lbltableeditor' as [Name],N'grdtableeditor' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1' as [Lx],N'54' as [Ly],N'3542' as [Sx],N'1764' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'default' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'GridControl' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'0' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'plgfwcommand' as [Name],N'' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'g' as [Type],N'0' as [Lx],N'1817' as [Ly],N'3542' as [Sx],N'196' as [Sy],N'0' as [ShowCaption],N'0' as [Padding],N'top' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'0' as [PaddingTop],N'0' as [PaddingLeft],N'0' as [PaddingBottom],N'0' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'-1' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'root' as [Name],N'' as [ControlName],N'' as [NamePa],N'' as [TabbedGroupParentName],N'g' as [Type],N'0' as [Lx],N'0' as [Ly],N'3542' as [Sx],N'2013' as [Sy],N'0' as [ShowCaption],N'0' as [Padding],N'top' as [TextLocation],N'0' as [GroupBordersVisible],N'1' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'' as [ControlType],N'0' as [ColumnSpan],N'0' as [RowSpan],N'default' as [CaptionHorizontalAlign],N'default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'0' as [PaddingTop],N'0' as [PaddingLeft],N'0' as [PaddingBottom],N'0' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'-1' as [TabPageOrder],N'0' as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'btnexport' as [Name],N'btnexport' as [ControlName],N'item1' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1360' as [Lx],N'0' as [Ly],N'254' as [Sx],N'35' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleFWButton' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'17' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'Export' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'item0' as [Name],N'' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'' as [Type],N'1008' as [Lx],N'0' as [Ly],N'265' as [Sx],N'31' as [Sy],N'0' as [ShowCaption],N'2' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'16' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'2' as [PaddingTop],N'2' as [PaddingLeft],N'2' as [PaddingBottom],N'2' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'item1' as [Name],N'' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'g' as [Type],N'0' as [Lx],N'31' as [Ly],N'1620' as [Sx],N'906' as [Sy],N'0' as [ShowCaption],N'0' as [Padding],N'Top' as [TextLocation],N'1' as [GroupBordersVisible],N'6' as [TypeLayout],N'2' as [Spacing],N'' as [BackColor],N'' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'0' as [PaddingTop],N'0' as [PaddingLeft],N'0' as [PaddingBottom],N'0' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'-1' as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],NULL as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lbl@month' as [Name],N'cbx@month' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'241' as [Lx],N'0' as [Ly],N'306' as [Sx],N'31' as [Sy],N'1' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SearchLookUpEdit_VTS' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'18' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'lbl@optionview' as [Name],N'cbx@optionview' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'743' as [Lx],N'0' as [Ly],N'265' as [Sx],N'31' as [Sy],N'1' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SearchLookUpEdit_VTS' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'16' as [WidthPercentage],NULL as [FixMinSize],NULL as [AlignContent],NULL as [BorderBottomColor],NULL as [BorderBottomSize],NULL as [BorderColor],NULL as [BorderLeftColor],NULL as [BorderLeftSize],NULL as [BorderRightColor],NULL as [BorderRightSize],NULL as [BorderSize],NULL as [BorderTopColor],NULL as [BorderTopSize],NULL as [BorderVisible],NULL as [ControlBackColor],NULL as [ControlBorderBottomColor],NULL as [ControlBorderBottomSize],NULL as [ControlBorderColor],NULL as [ControlBorderLeftColor],NULL as [ControlBorderLeftSize],NULL as [ControlBorderRightColor],NULL as [ControlBorderRightSize],NULL as [ControlBorderSize],NULL as [ControlBorderTopColor],NULL as [ControlBorderTopSize],NULL as [ControlForeColor],NULL as [ControlHorizontalAlign],NULL as [ControlPadding],NULL as [ControlVerticalAlign],NULL as [FontSize],NULL as [IconName],NULL as [ItemBackColor],NULL as [ItemBorderBottomColor],NULL as [ItemBorderBottomSize],NULL as [ItemBorderColor],NULL as [ItemBorderLeftColor],NULL as [ItemBorderLeftSize],NULL as [ItemBorderRightColor],NULL as [ItemBorderRightSize],NULL as [ItemBorderSize],NULL as [ItemBorderTopColor],NULL as [ItemBorderTopSize],NULL as [ItemForeColor],NULL as [ItemPadding],NULL as [MinGridPageSize],N'False' as [NotClientVisible],NULL as [NullTextMessageID],NULL as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],NULL as [ControlCellPadding],NULL as [MaxWidth],NULL as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],NULL as [FixWidthClient],NULL as [ErrorMessage],NULL as [borderRadius],NULL as [boxShadow],NULL as [IsValidation],NULL as [HorizontalAlign],NULL as [maxHeight],N'0' as [TextAlignMode],NULL as [minHeight],NULL as [HeightPercentageClient],NULL as [ControlBorderRadius],NULL as [ControlBoxShadow],NULL as [ControlPaddingBottom],NULL as [ControlPaddingLeft],NULL as [ControlPaddingRight],NULL as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],NULL as [LocationID],NULL as [ContainerType],NULL as [ControlNoBorder],NULL as [BackgroundImage],NULL as [labelMode],NULL as [selectionMode],NULL as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lbl@year' as [Name],N'cbx@year' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'0' as [Lx],N'0' as [Ly],N'241' as [Sx],N'31' as [Sy],N'1' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SearchLookUpEdit_VTS' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'14' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'lblexport.attendancesheet' as [Name],N'btnexport.attendancesheet' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1482' as [Lx],N'0' as [Ly],N'138' as [Sx],N'31' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleExportButton' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'12' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'-1' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'-14838986' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'CloudFile' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'lblexport.summarytimesheet' as [Name],N'btnexport.summarytimesheet' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'1273' as [Lx],N'0' as [Ly],N'209' as [Sx],N'31' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'SimpleExportButton' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'12' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'-1' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'-14838986' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'CloudFile' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'0' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'lblfilter' as [Name],N'txtfilter' as [ControlName],N'item1' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'0' as [Lx],N'0' as [Ly],N'1360' as [Sx],N'35' as [Sy],N'1' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'PopupContainerEdit' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'83' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'lblreload' as [Name],N'btnreload' as [ControlName],N'root' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'547' as [Lx],N'0' as [Ly],N'196' as [Sx],N'31' as [Sy],N'0' as [ShowCaption],N'1' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'ParadiseSimpleButtonBase' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'12' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'#339933' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'#FFFFFF' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'1' as [PaddingTop],N'1' as [PaddingLeft],N'1' as [PaddingBottom],N'1' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting' as [TableName],N'lbltableeditor' as [Name],N'grdtableeditor' as [ControlName],N'item1' as [NamePa],N'' as [TabbedGroupParentName],N'i' as [Type],N'0' as [Lx],N'35' as [Ly],N'1614' as [Sx],N'865' as [Sy],N'0' as [ShowCaption],N'3' as [Padding],N'Default' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'GridControl' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'3' as [PaddingTop],N'3' as [PaddingLeft],N'3' as [PaddingBottom],N'3' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],NULL as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],N'1' as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting' as [TableName],N'root' as [Name],N'' as [ControlName],N'' as [NamePa],N'' as [TabbedGroupParentName],N'g' as [Type],N'0' as [Lx],N'0' as [Ly],N'1620' as [Sx],N'937' as [Sy],N'0' as [ShowCaption],N'0' as [Padding],N'Top' as [TextLocation],N'0' as [GroupBordersVisible],N'6' as [TypeLayout],N'0' as [Spacing],N'' as [BackColor],N'' as [ControlType],NULL as [ColumnSpan],NULL as [RowSpan],N'Default' as [CaptionHorizontalAlign],N'Default' as [CaptionVerticalAlign],N'100' as [WidthPercentage],N'False' as [FixMinSize],N'' as [AlignContent],N'' as [BorderBottomColor],N'' as [BorderBottomSize],N'' as [BorderColor],N'' as [BorderLeftColor],N'' as [BorderLeftSize],N'' as [BorderRightColor],N'' as [BorderRightSize],N'' as [BorderSize],N'' as [BorderTopColor],N'' as [BorderTopSize],N'False' as [BorderVisible],N'' as [ControlBackColor],N'' as [ControlBorderBottomColor],N'' as [ControlBorderBottomSize],N'' as [ControlBorderColor],N'' as [ControlBorderLeftColor],N'' as [ControlBorderLeftSize],N'' as [ControlBorderRightColor],N'' as [ControlBorderRightSize],N'' as [ControlBorderSize],N'' as [ControlBorderTopColor],N'' as [ControlBorderTopSize],N'' as [ControlForeColor],N'' as [ControlHorizontalAlign],N'0' as [ControlPadding],N'' as [ControlVerticalAlign],N'' as [FontSize],N'' as [IconName],N'' as [ItemBackColor],N'' as [ItemBorderBottomColor],N'' as [ItemBorderBottomSize],N'' as [ItemBorderColor],N'' as [ItemBorderLeftColor],N'' as [ItemBorderLeftSize],N'' as [ItemBorderRightColor],N'' as [ItemBorderRightSize],N'' as [ItemBorderSize],N'' as [ItemBorderTopColor],N'' as [ItemBorderTopSize],N'' as [ItemForeColor],N'0' as [ItemPadding],N'0' as [MinGridPageSize],N'False' as [NotClientVisible],N'' as [NullTextMessageID],N'False' as [FullPageEmpty],N'0' as [PaddingTop],N'0' as [PaddingLeft],N'0' as [PaddingBottom],N'0' as [PaddingRight],N'0' as [ControlCellPadding],N'0' as [MaxWidth],N'0' as [MinWidth],N'-1' as [TabPageOrder],NULL as [SelectedTabPageIndex],N'0' as [FixWidthClient],N'' as [ErrorMessage],N'' as [borderRadius],N'' as [boxShadow],N'False' as [IsValidation],N'' as [HorizontalAlign],N'0' as [maxHeight],NULL as [TextAlignMode],N'0' as [minHeight],N'0' as [HeightPercentageClient],N'' as [ControlBorderRadius],N'' as [ControlBoxShadow],N'0' as [ControlPaddingBottom],N'0' as [ControlPaddingLeft],N'0' as [ControlPaddingRight],N'0' as [ControlPaddingTop],N'' as [ForeColor],N'0' as [CaptionWrap],N'0' as [LocationID],N'0' as [ContainerType],N'False' as [ControlNoBorder],NULL as [BackgroundImage],N'0' as [labelMode],N'0' as [selectionMode],N'0' as [deleteMode]
+
+DECLARE @sql VARCHAR(MAX) = 'TableName'+char(10)+'TypeLayout'
+EXEC sp_SaveData  @TableNameTmp = '#tblDataSettingLayout' , @TableName = 'tblDataSettingLayout' , @Command = 'DeleteNot',@ColumnDeleteNot=@sql , @IsDropTableTmp =0,@IsPrint=0
+EXEC sp_SaveData  @TableNameTmp = '#tblDataSettingLayout' , @TableName = 'tblDataSettingLayout' , @Command = 'insert,update', @IsDropTableTmp =0,@IsPrint=0
+IF OBJECT_ID('tempdb..#tblDataSettingLayout') IS NOT NULL DROP TABLE #tblDataSettingLayout
+--#endregion _
+GO
+
+--#region tblExportList
+IF OBJECT_ID('tempdb..#tblExportList') IS NOT NULL DROP TABLE #tblExportList
+  create table #tblExportList (
+   [ExportName] [nvarchar](MAX) NULL 
+ , [Description] [nvarchar](MAX) NULL 
+ , [ProcedureName] [nvarchar](MAX) NULL 
+ , [ExportType] [nvarchar](MAX) NULL 
+ , [TemplateFileName] [nvarchar](MAX) NULL 
+ , [StartRow] [int] NULL 
+ , [StartColumn] [int] NULL 
+ , [Catalog] [nvarchar](MAX) NULL 
+ , [ObjectId] [bigint] NULL 
+ , [Visible] [bit] NULL 
+ , [OneSheet] [bit] NULL 
+ , [TempStart] [int] NULL 
+ , [TempEnd] [int] NULL 
+ , [TempDataStart] [int] NULL 
+ , [TempRowEmpty] [smallint] NULL 
+ , [MergeFormat] [nvarchar](MAX) NULL 
+ , [IsAllBoder] [bit] NULL 
+ , [ListSheetMerge] [nvarchar](MAX) NULL 
+ , [IsExportHeader] [bit] NULL 
+ , [MultipleReport] [bit] NULL 
+ , [BestFixColumn] [bit] NULL 
+ , [BestFixHeaderCount] [int] NULL 
+ , [TemplateSheetIndex] [int] NULL 
+ , [OneHeaderPerRow] [int] NULL 
+ , [NotShowInExportList] [bit] NULL 
+ , [InsertCellInsRow] [decimal] NULL 
+ , [ReloadFormAfterExport] [bit] NULL 
+ , [FollowConfigTable] [bit] NULL 
+ , [NotRequireSave] [bit] NULL 
+ , [IsTemplateImport] [bit] NULL 
+ , [RequireCheckHeader] [bit] NULL 
+ , [Frequency] [int] NULL 
+ , [LockExportData] [bit] NULL 
+ , [DescriptionEN] [nvarchar](MAX) NULL 
+ , [ProcExportCompleted] [nvarchar](MAX) NULL 
+ , [ExportMergeEmployeeCount] [int] NULL 
+ , [ProcAfterExport] [nvarchar](MAX) NULL 
+)
+
+ INSERT INTO #tblExportList([ExportName],[Description],[ProcedureName],[ExportType],[TemplateFileName],[StartRow],[StartColumn],[Catalog],[ObjectId],[Visible],[OneSheet],[TempStart],[TempEnd],[TempDataStart],[TempRowEmpty],[MergeFormat],[IsAllBoder],[ListSheetMerge],[IsExportHeader],[MultipleReport],[BestFixColumn],[BestFixHeaderCount],[TemplateSheetIndex],[OneHeaderPerRow],[NotShowInExportList],[InsertCellInsRow],[ReloadFormAfterExport],[FollowConfigTable],[NotRequireSave],[IsTemplateImport],[RequireCheckHeader],[Frequency],[LockExportData],[DescriptionEN],[ProcExportCompleted],[ExportMergeEmployeeCount],[ProcAfterExport])
+Select  N'AttendanceSheet' as [ExportName],N'Attendance Sheet' as [Description],N'sp_AttendanceSummaryMonthlyInOutExport' as [ProcedureName],N'Excel' as [ExportType],N'TRIPOD_TimesheetDetail.xlsx' as [TemplateFileName],N'8' as [StartRow],N'1' as [StartColumn],N'TA' as [Catalog],N'501' as [ObjectId],N'True' as [Visible],NULL as [OneSheet],NULL as [TempStart],NULL as [TempEnd],NULL as [TempDataStart],NULL as [TempRowEmpty],NULL as [MergeFormat],NULL as [IsAllBoder],NULL as [ListSheetMerge],NULL as [IsExportHeader],NULL as [MultipleReport],NULL as [BestFixColumn],NULL as [BestFixHeaderCount],NULL as [TemplateSheetIndex],NULL as [OneHeaderPerRow],NULL as [NotShowInExportList],NULL as [InsertCellInsRow],NULL as [ReloadFormAfterExport],N'True' as [FollowConfigTable],NULL as [NotRequireSave],NULL as [IsTemplateImport],NULL as [RequireCheckHeader],N'41' as [Frequency],NULL as [LockExportData],NULL as [DescriptionEN],NULL as [ProcExportCompleted],NULL as [ExportMergeEmployeeCount],NULL as [ProcAfterExport] UNION ALL
+
+Select  N'Export_AttandanceMonth' as [ExportName],N'Xuất báo cáo chấm công tháng' as [Description],N'sp_ExportAttendanceMonth' as [ProcedureName],N'Excel' as [ExportType],N'Export_AttandanceMonthly.xlsx' as [TemplateFileName],NULL as [StartRow],NULL as [StartColumn],N'PR' as [Catalog],N'501' as [ObjectId],N'True' as [Visible],NULL as [OneSheet],NULL as [TempStart],NULL as [TempEnd],NULL as [TempDataStart],NULL as [TempRowEmpty],NULL as [MergeFormat],NULL as [IsAllBoder],NULL as [ListSheetMerge],NULL as [IsExportHeader],NULL as [MultipleReport],NULL as [BestFixColumn],NULL as [BestFixHeaderCount],NULL as [TemplateSheetIndex],NULL as [OneHeaderPerRow],NULL as [NotShowInExportList],NULL as [InsertCellInsRow],NULL as [ReloadFormAfterExport],N'True' as [FollowConfigTable],NULL as [NotRequireSave],NULL as [IsTemplateImport],NULL as [RequireCheckHeader],N'615' as [Frequency],NULL as [LockExportData],NULL as [DescriptionEN],NULL as [ProcExportCompleted],NULL as [ExportMergeEmployeeCount],NULL as [ProcAfterExport] UNION ALL
+
+Select  N'SummaryTimesheet' as [ExportName],N'Tổng kết giờ tăng ca và nghỉ phép' as [Description],N'sp_exportSummaryTimesheet' as [ProcedureName],N'Excel' as [ExportType],N'TRIPOD_Overtime&Leave_Summarization.xlsx' as [TemplateFileName],NULL as [StartRow],NULL as [StartColumn],N'TA' as [Catalog],N'501' as [ObjectId],N'True' as [Visible],NULL as [OneSheet],NULL as [TempStart],NULL as [TempEnd],NULL as [TempDataStart],NULL as [TempRowEmpty],NULL as [MergeFormat],NULL as [IsAllBoder],NULL as [ListSheetMerge],NULL as [IsExportHeader],NULL as [MultipleReport],NULL as [BestFixColumn],NULL as [BestFixHeaderCount],NULL as [TemplateSheetIndex],NULL as [OneHeaderPerRow],NULL as [NotShowInExportList],NULL as [InsertCellInsRow],NULL as [ReloadFormAfterExport],N'True' as [FollowConfigTable],NULL as [NotRequireSave],NULL as [IsTemplateImport],NULL as [RequireCheckHeader],N'33' as [Frequency],NULL as [LockExportData],NULL as [DescriptionEN],NULL as [ProcExportCompleted],NULL as [ExportMergeEmployeeCount],NULL as [ProcAfterExport]
+
+EXEC sp_SaveData  @TableNameTmp = '#tblExportList' , @TableName = 'tblExportList' , @Command = 'DeleteNot',@ColumnDeleteNot='ExportName' , @IsDropTableTmp =0,@IsPrint=0
+EXEC sp_SaveData  @TableNameTmp = '#tblExportList' , @TableName = 'tblExportList' , @Command = 'insert,update' , @IsDropTableTmp =0,@IsPrint=0
+IF OBJECT_ID('tempdb..#tblExportList') IS NOT NULL DROP TABLE #tblExportList
+--#endregion _
+GO
+
+--#region tblMD_Message
+IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message 
+IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message
+  create table #tblMD_Message (
+   [MessageID] [nvarchar](MAX) NULL 
+ , [Language] [nvarchar](MAX) NULL 
+ , [Content] [nvarchar](MAX) NULL 
+ , [Frequency] [bigint] NULL 
+ , [IgnorePending] [bit] NULL 
+)
+
+ INSERT INTO #tblMD_Message([MessageID],[Language],[Content],[Frequency],[IgnorePending])
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'CN' as [Language],N'十六' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'CN' as [Language],N'十七' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'CN' as [Language],N'十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'CN' as [Language],N'十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'CN' as [Language],N'工作时间' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'CN' as [Language],N'二十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'CN' as [Language],N'二十一' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'CN' as [Language],N'二十二' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'CN' as [Language],N'二十三' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'CN' as [Language],N'二十四' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'CN' as [Language],N'二十五' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'CN' as [Language],N'二十六' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'CN' as [Language],N'二十七' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'CN' as [Language],N'二十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'CN' as [Language],N'二十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'CN' as [Language],N'三十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.STD_WorkingDays' as [MessageID],N'CN' as [Language],N'標準工作天' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalDayOff' as [MessageID],N'CN' as [Language],N'休假' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'CN' as [Language],N'公开工资' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'CN' as [Language],N'无薪假期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10Att' as [MessageID],N'EN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11Att' as [MessageID],N'EN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12Att' as [MessageID],N'EN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13Att' as [MessageID],N'EN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14Att' as [MessageID],N'EN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15Att' as [MessageID],N'EN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'EN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'EN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'EN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'EN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'EN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'EN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'EN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'EN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'EN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'EN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'EN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'EN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'EN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'EN' as [Language],N'28' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'EN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2Att' as [MessageID],N'EN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'EN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31Att' as [MessageID],N'EN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3Att' as [MessageID],N'EN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4Att' as [MessageID],N'EN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5Att' as [MessageID],N'EN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6Att' as [MessageID],N'EN' as [Language],N'6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7Att' as [MessageID],N'EN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8Att' as [MessageID],N'EN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9Att' as [MessageID],N'EN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT1' as [MessageID],N'EN' as [Language],N'OT1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT2a' as [MessageID],N'EN' as [Language],N'OT2a' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT3' as [MessageID],N'EN' as [Language],N'OT3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT4' as [MessageID],N'EN' as [Language],N'OT4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT5' as [MessageID],N'EN' as [Language],N'OT5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeaveHrs' as [MessageID],N'EN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.STD_WorkingDays' as [MessageID],N'EN' as [Language],N'STD WKDs' as [Content],N'82' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'EN' as [Language],N'Total paid days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'EN' as [Language],N'Unpaid Leave' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.WorkHours' as [MessageID],N'EN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10Att' as [MessageID],N'VN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11Att' as [MessageID],N'VN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12Att' as [MessageID],N'VN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13Att' as [MessageID],N'VN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14Att' as [MessageID],N'VN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15Att' as [MessageID],N'VN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'VN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'VN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'VN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'VN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'VN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'VN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'VN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'VN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'VN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'VN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'VN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'VN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'VN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'VN' as [Language],N'28' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'VN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2Att' as [MessageID],N'VN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'VN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31Att' as [MessageID],N'VN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3Att' as [MessageID],N'VN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4Att' as [MessageID],N'VN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5Att' as [MessageID],N'VN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6Att' as [MessageID],N'VN' as [Language],N'6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7Att' as [MessageID],N'VN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8Att' as [MessageID],N'VN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9Att' as [MessageID],N'VN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.Actual_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công thực tế' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.DepartmentName' as [MessageID],N'VN' as [Language],N'Phòng ban' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.HireDate' as [MessageID],N'VN' as [Language],N'Ngày vào làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.IOHrs' as [MessageID],N'VN' as [Language],N'Trễ/
+sớm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.item0' as [MessageID],N'VN' as [Language],N'item0' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.item1' as [MessageID],N'VN' as [Language],N'item1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@optionview' as [MessageID],N'VN' as [Language],N'Chế độ xem' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeaveHrs' as [MessageID],N'VN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.STD_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công chuẩn' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalDayOff' as [MessageID],N'VN' as [Language],N'Ngày nghỉ' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalNS' as [MessageID],N'VN' as [Language],N'NS Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalOT' as [MessageID],N'VN' as [Language],N'Tổng OT' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'VN' as [Language],N'Công hưởng lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'VN' as [Language],N'Unpaid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.WorkHours' as [MessageID],N'VN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending]
+EXEC sp_SaveData  @TableNameTmp = '#tblMD_Message' , @TableName = 'tblMD_Message' , @Command = 'insert,update' , @IsDropTableTmp =0,@IsPrint=0IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message
+--#endregion _
+GO
+
+--#region tblMD_Message
+IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message 
+IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message
+  create table #tblMD_Message (
+   [MessageID] [nvarchar](MAX) NULL 
+ , [Language] [nvarchar](MAX) NULL 
+ , [Content] [nvarchar](MAX) NULL 
+ , [Frequency] [bigint] NULL 
+ , [IgnorePending] [bit] NULL 
+)
+
+ INSERT INTO #tblMD_Message([MessageID],[Language],[Content],[Frequency],[IgnorePending])
+Select  N'0' as [MessageID],N'CN' as [Language],N'零' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0' as [MessageID],N'En' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0' as [MessageID],N'KR' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0' as [MessageID],N'vn' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0.vldt' as [MessageID],N'En' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0.vldt' as [MessageID],N'KR' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'0.vldt' as [MessageID],N'vn' as [Language],N'Không đi làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1' as [MessageID],N'EN' as [Language],N'Seniority allowance (long term)' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1' as [MessageID],N'VN' as [Language],N'Seniority allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1.vldt' as [MessageID],N'EN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1.vldt' as [MessageID],N'KR' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1.vldt' as [MessageID],N'VN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10' as [MessageID],N'EN' as [Language],N'Regional(area) allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10' as [MessageID],N'VN' as [Language],N'Regional (area) allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10.vldt' as [MessageID],N'EN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10.vldt' as [MessageID],N'KR' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10.vldt' as [MessageID],N'VN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10Att' as [MessageID],N'CN' as [Language],N'10Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10Att' as [MessageID],N'EN' as [Language],N'10th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'10Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11' as [MessageID],N'EN' as [Language],N'Incentive allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11' as [MessageID],N'VN' as [Language],N'Incentive allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11.vldt' as [MessageID],N'EN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11.vldt' as [MessageID],N'KR' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11.vldt' as [MessageID],N'VN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11Att' as [MessageID],N'CN' as [Language],N'11Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11Att' as [MessageID],N'EN' as [Language],N'11th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'11Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12' as [MessageID],N'EN' as [Language],N'Key process allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12' as [MessageID],N'VN' as [Language],N'Key process allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12.vldt' as [MessageID],N'EN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12.vldt' as [MessageID],N'KR' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12.vldt' as [MessageID],N'VN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12Att' as [MessageID],N'CN' as [Language],N'12Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12Att' as [MessageID],N'EN' as [Language],N'12th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'12Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13' as [MessageID],N'EN' as [Language],N'Bonus 6 month' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13' as [MessageID],N'VN' as [Language],N'Bonus 6 month' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13.vldt' as [MessageID],N'EN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13.vldt' as [MessageID],N'KR' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13.vldt' as [MessageID],N'VN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13Att' as [MessageID],N'CN' as [Language],N'13Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13Att' as [MessageID],N'EN' as [Language],N'13th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'13Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14' as [MessageID],N'EN' as [Language],N'Performance & Responsibility' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14' as [MessageID],N'VN' as [Language],N'Performance & Responsibility' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14.vldt' as [MessageID],N'EN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14.vldt' as [MessageID],N'KR' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14.vldt' as [MessageID],N'VN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14Att' as [MessageID],N'CN' as [Language],N'14Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14Att' as [MessageID],N'EN' as [Language],N'14th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'14Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15' as [MessageID],N'EN' as [Language],N'Bonus 6 month full attendance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15' as [MessageID],N'VN' as [Language],N'Bonus 6 month full attendance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15.vldt' as [MessageID],N'EN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15.vldt' as [MessageID],N'KR' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15.vldt' as [MessageID],N'VN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15Att' as [MessageID],N'CN' as [Language],N'15Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15Att' as [MessageID],N'EN' as [Language],N'15th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'15Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16' as [MessageID],N'EN' as [Language],N'[Foreign] Meal allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16' as [MessageID],N'VN' as [Language],N'[Foreign] Meal allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16.vldt' as [MessageID],N'EN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16.vldt' as [MessageID],N'KR' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16.vldt' as [MessageID],N'VN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16Att' as [MessageID],N'CN' as [Language],N'16Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16Att' as [MessageID],N'EN' as [Language],N'16th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'16Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17' as [MessageID],N'EN' as [Language],N'[Foreign] House allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17' as [MessageID],N'VN' as [Language],N'[Foreign] House allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17.vldt' as [MessageID],N'EN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17.vldt' as [MessageID],N'KR' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17.vldt' as [MessageID],N'VN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17Att' as [MessageID],N'CN' as [Language],N'17Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17Att' as [MessageID],N'EN' as [Language],N'17th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'17Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18' as [MessageID],N'CN' as [Language],N'十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18' as [MessageID],N'EN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18' as [MessageID],N'KR' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18' as [MessageID],N'VN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18.vldt' as [MessageID],N'EN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18.vldt' as [MessageID],N'KR' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18.vldt' as [MessageID],N'VN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18Att' as [MessageID],N'CN' as [Language],N'18Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18Att' as [MessageID],N'EN' as [Language],N'18th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'18Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19' as [MessageID],N'CN' as [Language],N'十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19' as [MessageID],N'EN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19' as [MessageID],N'KR' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19' as [MessageID],N'VN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19.vldt' as [MessageID],N'EN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19.vldt' as [MessageID],N'KR' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19.vldt' as [MessageID],N'VN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19Att' as [MessageID],N'CN' as [Language],N'19Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19Att' as [MessageID],N'EN' as [Language],N'19th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'19Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1Att' as [MessageID],N'CN' as [Language],N'1Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1Att' as [MessageID],N'EN' as [Language],N'1st' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'1Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2' as [MessageID],N'EN' as [Language],N'Production bonus' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2' as [MessageID],N'VN' as [Language],N'Production bonus' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2.vldt' as [MessageID],N'EN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2.vldt' as [MessageID],N'KR' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2.vldt' as [MessageID],N'VN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20' as [MessageID],N'CN' as [Language],N'二十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20' as [MessageID],N'EN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20' as [MessageID],N'KR' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20' as [MessageID],N'VN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20.vldt' as [MessageID],N'EN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20.vldt' as [MessageID],N'KR' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20.vldt' as [MessageID],N'VN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20Att' as [MessageID],N'CN' as [Language],N'20Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20Att' as [MessageID],N'EN' as [Language],N'20th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'20Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21' as [MessageID],N'CN' as [Language],N'二十一' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21' as [MessageID],N'EN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21' as [MessageID],N'KR' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21' as [MessageID],N'VN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21.vldt' as [MessageID],N'EN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21.vldt' as [MessageID],N'KR' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21.vldt' as [MessageID],N'VN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21Att' as [MessageID],N'CN' as [Language],N'21Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21Att' as [MessageID],N'EN' as [Language],N'21st' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'21Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22' as [MessageID],N'CN' as [Language],N'二十二' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22' as [MessageID],N'EN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22' as [MessageID],N'KR' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22' as [MessageID],N'VN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22.vldt' as [MessageID],N'EN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22.vldt' as [MessageID],N'KR' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22.vldt' as [MessageID],N'VN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22Att' as [MessageID],N'CN' as [Language],N'22Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22Att' as [MessageID],N'EN' as [Language],N'22nd' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'22Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23' as [MessageID],N'CN' as [Language],N'二十三' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23' as [MessageID],N'EN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23' as [MessageID],N'KR' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23' as [MessageID],N'VN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23.vldt' as [MessageID],N'EN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23.vldt' as [MessageID],N'KR' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23.vldt' as [MessageID],N'VN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23Att' as [MessageID],N'CN' as [Language],N'23Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23Att' as [MessageID],N'EN' as [Language],N'23rd' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'23Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24' as [MessageID],N'CN' as [Language],N'二十四' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24' as [MessageID],N'EN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24' as [MessageID],N'KR' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24' as [MessageID],N'VN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24.vldt' as [MessageID],N'EN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24.vldt' as [MessageID],N'KR' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24.vldt' as [MessageID],N'VN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24Att' as [MessageID],N'CN' as [Language],N'24Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24Att' as [MessageID],N'EN' as [Language],N'24th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'24Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25' as [MessageID],N'CN' as [Language],N'二十五' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25' as [MessageID],N'EN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25' as [MessageID],N'KR' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25' as [MessageID],N'VN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25.vldt' as [MessageID],N'EN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25.vldt' as [MessageID],N'KR' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25.vldt' as [MessageID],N'VN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25Att' as [MessageID],N'CN' as [Language],N'25Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25Att' as [MessageID],N'EN' as [Language],N'25th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'25Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26' as [MessageID],N'CN' as [Language],N'二十六' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26' as [MessageID],N'EN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26' as [MessageID],N'KR' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26' as [MessageID],N'VN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26.vldt' as [MessageID],N'EN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26.vldt' as [MessageID],N'KR' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26.vldt' as [MessageID],N'VN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26Att' as [MessageID],N'CN' as [Language],N'26Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26Att' as [MessageID],N'EN' as [Language],N'26th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'26Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27' as [MessageID],N'CN' as [Language],N'二十七' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27' as [MessageID],N'EN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27' as [MessageID],N'KR' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27' as [MessageID],N'VN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27.vldt' as [MessageID],N'EN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27.vldt' as [MessageID],N'KR' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27.vldt' as [MessageID],N'VN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27Att' as [MessageID],N'CN' as [Language],N'27Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27Att' as [MessageID],N'EN' as [Language],N'27th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'27Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28' as [MessageID],N'CN' as [Language],N'二十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28' as [MessageID],N'EN' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28' as [MessageID],N'KR' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28' as [MessageID],N'VN' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28.vldt' as [MessageID],N'EN' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28.vldt' as [MessageID],N'KR' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28.vldt' as [MessageID],N'VN' as [Language],N'28' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28Att' as [MessageID],N'CN' as [Language],N'28Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28Att' as [MessageID],N'EN' as [Language],N'28th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'28Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29' as [MessageID],N'CN' as [Language],N'二十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29' as [MessageID],N'EN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29' as [MessageID],N'KR' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29' as [MessageID],N'VN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29.vldt' as [MessageID],N'EN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29.vldt' as [MessageID],N'KR' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29.vldt' as [MessageID],N'VN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29Att' as [MessageID],N'CN' as [Language],N'29Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29Att' as [MessageID],N'EN' as [Language],N'29th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'29Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2Att' as [MessageID],N'CN' as [Language],N'2Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2Att' as [MessageID],N'EN' as [Language],N'2nd' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'2Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3' as [MessageID],N'EN' as [Language],N'Foreign language allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3' as [MessageID],N'VN' as [Language],N'Foreign language allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3.vldt' as [MessageID],N'EN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3.vldt' as [MessageID],N'KR' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3.vldt' as [MessageID],N'VN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30' as [MessageID],N'CN' as [Language],N'三十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30' as [MessageID],N'EN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30' as [MessageID],N'KR' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30' as [MessageID],N'VN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30.vldt' as [MessageID],N'EN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30.vldt' as [MessageID],N'KR' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30.vldt' as [MessageID],N'VN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30Att' as [MessageID],N'CN' as [Language],N'30Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30Att' as [MessageID],N'EN' as [Language],N'30th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'30Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'31' as [MessageID],N'EN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'31' as [MessageID],N'VN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'31Att' as [MessageID],N'CN' as [Language],N'31Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'31Att' as [MessageID],N'EN' as [Language],N'31st' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'31Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3Att' as [MessageID],N'CN' as [Language],N'3Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3Att' as [MessageID],N'EN' as [Language],N'3rd' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'3Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4' as [MessageID],N'EN' as [Language],N'Environmental allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4' as [MessageID],N'VN' as [Language],N'Environmental allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4.vldt' as [MessageID],N'EN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4.vldt' as [MessageID],N'KR' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4.vldt' as [MessageID],N'VN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'40' as [MessageID],N'VN' as [Language],N'40h' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'48' as [MessageID],N'VN' as [Language],N'48h' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4Att' as [MessageID],N'CN' as [Language],N'4Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4Att' as [MessageID],N'EN' as [Language],N'4th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'4Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5' as [MessageID],N'EN' as [Language],N'Shift allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5' as [MessageID],N'VN' as [Language],N'Shift allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5.vldt' as [MessageID],N'EN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5.vldt' as [MessageID],N'KR' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5.vldt' as [MessageID],N'VN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'53' as [MessageID],N'CN' as [Language],N'SECURITY: You have not authorized to access this function!' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'53' as [MessageID],N'EN' as [Language],N'SECURITY: You have not authorized to access this function!' as [Content],N'11' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'53' as [MessageID],N'VN' as [Language],N'Bảo mật: Bạn không có quyền truy cập chức năng này! ' as [Content],N'11' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5Att' as [MessageID],N'CN' as [Language],N'5Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5Att' as [MessageID],N'EN' as [Language],N'5th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'5Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6' as [MessageID],N'EN' as [Language],N'Fuel allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6' as [MessageID],N'VN' as [Language],N'Fuel allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6.vldt' as [MessageID],N'EN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6.vldt' as [MessageID],N'KR' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6.vldt' as [MessageID],N'VN' as [Language],N'6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6Att' as [MessageID],N'CN' as [Language],N'6Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6Att' as [MessageID],N'EN' as [Language],N'6th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'6Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7' as [MessageID],N'EN' as [Language],N'Professional allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7' as [MessageID],N'VN' as [Language],N'Professional allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7.vldt' as [MessageID],N'EN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7.vldt' as [MessageID],N'KR' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7.vldt' as [MessageID],N'VN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7Att' as [MessageID],N'CN' as [Language],N'7Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7Att' as [MessageID],N'EN' as [Language],N'7th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'7Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8' as [MessageID],N'EN' as [Language],N'Attendance allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8' as [MessageID],N'VN' as [Language],N'Attendance allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8.vldt' as [MessageID],N'EN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8.vldt' as [MessageID],N'KR' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8.vldt' as [MessageID],N'VN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8Att' as [MessageID],N'CN' as [Language],N'8Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8Att' as [MessageID],N'EN' as [Language],N'8th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'8Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9' as [MessageID],N'EN' as [Language],N'Meal allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9' as [MessageID],N'VN' as [Language],N'Meal allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9.vldt' as [MessageID],N'EN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9.vldt' as [MessageID],N'KR' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9.vldt' as [MessageID],N'VN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9Att' as [MessageID],N'CN' as [Language],N'9Att' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9Att' as [MessageID],N'EN' as [Language],N'9th' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'9Att' as [MessageID],N'VN' as [Language],N'Att' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'A' as [MessageID],N'EN' as [Language],N'A' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'A' as [MessageID],N'VN' as [Language],N'A' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'Actual_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công thực tế' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'AWP' as [MessageID],N'EN' as [Language],N'AWP' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'AWP' as [MessageID],N'VN' as [Language],N'AWP' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'B1' as [MessageID],N'EN' as [Language],N'B1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'B1' as [MessageID],N'VN' as [Language],N'B1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'CN' as [Language],N'导出到Excel' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'EN' as [Language],N'Export to excel' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'JP' as [Language],N'リセット' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'KO' as [Language],N'엑셀로 내보내기' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'KR' as [Language],N'Export to excel' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnExport' as [MessageID],N'VN' as [Language],N'Xuất excel' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'CN' as [Language],N'新增' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'EN' as [Language],N'Add new' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'JP' as [Language],N'追加' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'KO' as [Language],N'새로 추가' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'KR' as [Language],N'Add new' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWAdd' as [MessageID],N'VN' as [Language],N'Thêm mới' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'CN' as [Language],N'删掉' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'EN' as [Language],N'Delete' as [Content],N'36' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'JP' as [Language],N'削除' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'KO' as [Language],N'삭제' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'KR' as [Language],N'Delete' as [Content],N'36' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWDelete' as [MessageID],N'VN' as [Language],N'Xóa bỏ' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'CN' as [Language],N'重做' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'EN' as [Language],N'Reset' as [Content],N'34' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'JP' as [Language],N'リセット' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'KO' as [Language],N'재실행' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'KR' as [Language],N'Reset' as [Content],N'34' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWReset' as [MessageID],N'VN' as [Language],N'Làm lại' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWSave' as [MessageID],N'CN' as [Language],N'保存数据' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWSave' as [MessageID],N'EN' as [Language],N'Save' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWSave' as [MessageID],N'JP' as [Language],N'保存' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWSave' as [MessageID],N'KO' as [Language],N'저장' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'BtnfwSave' as [MessageID],N'KR' as [Language],N'저장' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnFWSave' as [MessageID],N'VN' as [Language],N'Lưu' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnImport' as [MessageID],N'CN' as [Language],N'导入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnImport' as [MessageID],N'EN' as [Language],N'Import' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnImport' as [MessageID],N'KO' as [Language],N'들어가다' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnImport' as [MessageID],N'KR' as [Language],N'Import' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnImport' as [MessageID],N'VN' as [Language],N'Nhập vào' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnReload' as [MessageID],N'CN' as [Language],N'重新載入資料' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnReload' as [MessageID],N'EN' as [Language],N'Refresh' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnReload' as [MessageID],N'KO' as [Language],N'새로 고침' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'BtnReload' as [MessageID],N'KR' as [Language],N'새로 만들기' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'btnReload' as [MessageID],N'VN' as [Language],N'Làm Mới' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@month' as [MessageID],N'CN' as [Language],N'月份' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@month' as [MessageID],N'EN' as [Language],N'Month' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@month' as [MessageID],N'KO' as [Language],N'달' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@month' as [MessageID],N'VN' as [Language],N'Tháng' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@OptionView' as [MessageID],N'EN' as [Language],N'Option' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@OptionView' as [MessageID],N'VN' as [Language],N'Chế độ xem' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@Year' as [MessageID],N'CN' as [Language],N'年' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@Year' as [MessageID],N'EN' as [Language],N'Year' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@Year' as [MessageID],N'KO' as [Language],N'년' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'cbx@Year' as [MessageID],N'VN' as [Language],N'Năm' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ddbRptTemplates' as [MessageID],N'CN' as [Language],N'獲取導入模板文件' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ddbRptTemplates' as [MessageID],N'EN' as [Language],N'Get Import Template File' as [Content],N'3' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ddbRptTemplates' as [MessageID],N'KO' as [Language],N'언어 입력 템플릿 파일' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ddbRptTemplates' as [MessageID],N'KR' as [Language],N'잔업 신청서' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ddbRptTemplates' as [MessageID],N'VN' as [Language],N'File mẫu nhập ngôn ngữ' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'DepartmentName' as [MessageID],N'CN' as [Language],N'部门名称' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'DepartmentName' as [MessageID],N'EN' as [Language],N'Department name' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'DepartmentName' as [MessageID],N'VN' as [Language],N'Phòng ban' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid' as [MessageID],N'CN' as [Language],N'员工编号' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid' as [MessageID],N'EN' as [Language],N'Employee ID' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'EmployeeID' as [MessageID],N'JP' as [Language],N'従業員コード' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid' as [MessageID],N'KO' as [Language],N'직원 코드' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'EmployeeID' as [MessageID],N'KR' as [Language],N'사원 번호' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid' as [MessageID],N'VN' as [Language],N'Mã nhân viên' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid.vldt' as [MessageID],N'EN' as [Language],N'Employee code' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'EmployeeID.vldt' as [MessageID],N'JP' as [Language],N'従業員コード' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'EmployeeID.vldt' as [MessageID],N'KR' as [Language],N'사원 번호' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'employeeid.vldt' as [MessageID],N'VN' as [Language],N'Mã nhân viên' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'CN' as [Language],N'姓名' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'EN' as [Language],N'Full name' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'JP' as [Language],N'フルネーム' as [Content],N'400' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'KO' as [Language],N'직원 이름' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'KR' as [Language],N'날짜' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName' as [MessageID],N'VN' as [Language],N'Tên nhân viên' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName.vldt' as [MessageID],N'EN' as [Language],N'Staff''s name' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName.vldt' as [MessageID],N'JP' as [Language],N'フルネーム' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName.vldt' as [MessageID],N'KR' as [Language],N'날짜' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'FullName.vldt' as [MessageID],N'VN' as [Language],N'Tên nhân viên' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'grdTableEditor' as [MessageID],N'EN' as [Language],N'Training course list' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'grdTableEditor' as [MessageID],N'KR' as [Language],N'Training course list' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'grdTableEditor' as [MessageID],N'VN' as [Language],N'Danh sách đơn chờ duyệt' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate' as [MessageID],N'CN' as [Language],N'入职日期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate' as [MessageID],N'EN' as [Language],N'Hire date' as [Content],N'23' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate' as [MessageID],N'KO' as [Language],N'하루는 일을 시작합니다' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate' as [MessageID],N'KR' as [Language],N'Join date' as [Content],N'23' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate' as [MessageID],N'VN' as [Language],N'Ngày bắt đầu vào làm' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate.vldt' as [MessageID],N'EN' as [Language],N'Join date' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate.vldt' as [MessageID],N'KR' as [Language],N'Join date' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'HireDate.vldt' as [MessageID],N'VN' as [Language],N'Ngày bắt đầu vào làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'IOHrs' as [MessageID],N'VN' as [Language],N'Trễ/sớm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item0' as [MessageID],N'CN' as [Language],N'修改密码' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item0' as [MessageID],N'EN' as [Language],N'item0' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item0' as [MessageID],N'KO' as [Language],N'월페이퍼' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item0' as [MessageID],N'KR' as [Language],N'승인 정보' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item0' as [MessageID],N'VN' as [Language],N'Hình nền' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item1' as [MessageID],N'CN' as [Language],N'年假' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item1' as [MessageID],N'EN' as [Language],N'annual leave' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item1' as [MessageID],N'KO' as [Language],N'연차' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item1' as [MessageID],N'KR' as [Language],N'신청 명단' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'item1' as [MessageID],N'VN' as [Language],N'Nghỉ phép năm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'L' as [MessageID],N'EN' as [Language],N'L' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'L' as [MessageID],N'VN' as [Language],N'L' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@month' as [MessageID],N'CN' as [Language],N'月份' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@month' as [MessageID],N'EN' as [Language],N'Month' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@month' as [MessageID],N'KO' as [Language],N'달' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@month' as [MessageID],N'VN' as [Language],N'Tháng' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@optionview' as [MessageID],N'CN' as [Language],N'选配' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@optionview' as [MessageID],N'EN' as [Language],N'Option' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@optionview' as [MessageID],N'VN' as [Language],N'Chế độ xem' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@Year' as [MessageID],N'CN' as [Language],N'年' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@Year' as [MessageID],N'EN' as [Language],N'Year' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@Year' as [MessageID],N'KO' as [Language],N'년' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lbl@Year' as [MessageID],N'VN' as [Language],N'Năm' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblFilter' as [MessageID],N'CN' as [Language],N'搜索' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblFilter' as [MessageID],N'EN' as [Language],N'Search' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblFilter' as [MessageID],N'KO' as [Language],N'검색' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblFilter' as [MessageID],N'KR' as [Language],N'검색' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblFilter' as [MessageID],N'VN' as [Language],N'Tìm kiếm' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblReload' as [MessageID],N'CN' as [Language],N'影片播放清单' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblReload' as [MessageID],N'EN' as [Language],N'Resident address' as [Content],N'2' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblReload' as [MessageID],N'KO' as [Language],N'코드' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblReload' as [MessageID],N'KR' as [Language],N'Resident address' as [Content],N'2' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblReload' as [MessageID],N'VN' as [Language],N'Làm Mới' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblTableEditor' as [MessageID],N'CN' as [Language],N'<color = crimson>如果更改标题，请单击新行以添加。生效日期无法更正，因此，如果生效日期不正确，请删除错误的行，然后添加一个新行以进行更正。</ color>' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblTableEditor' as [MessageID],N'EN' as [Language],N'<color = crimson> If you change the title, click on a new line to add it. The effective date cannot be edited, so if the effective date is wrong, delete the wrong line, then add a new line to correct. </color>' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblTableEditor' as [MessageID],N'KO' as [Language],N'<color = crimson> 제목을 변경하는 경우 추가 할 새 줄을 클릭하십시오. 유효 날짜를 편집 할 수 없으므로 유효 날짜가 틀린 경우 잘못된 줄을 삭제 한 다음 올바른 새 줄을 추가하십시오. </ color>' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblTableEditor' as [MessageID],N'KR' as [Language],N'<color = crimson> If you change the title, click on a new line to add it. The effective date cannot be edited, so if the effective date is wrong, delete the wrong line, then add a new line to correct. </color>' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'lblTableEditor' as [MessageID],N'VN' as [Language],N'<color=crimson>Nếu thay đổi chức danh thì bấm vào dòng mới để thêm.Ngày hiệu lực không sửa được nên nếu ngày hiệu lực sai thì xóa dòng sai đi, sau đó thêm 1 dòng mới cho đúng.</color>' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'M' as [MessageID],N'EN' as [Language],N'M' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'M' as [MessageID],N'VN' as [Language],N'M' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'M1' as [MessageID],N'EN' as [Language],N'M1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'M1' as [MessageID],N'VN' as [Language],N'M1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'MnuTAD999' as [MessageID],N'CN' as [Language],N'月度考勤汇总（标准数据设置）' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'MnuTAD999' as [MessageID],N'EN' as [Language],N'Timesheet' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'MnuTAD999' as [MessageID],N'VN' as [Language],N'Bảng tổng hợp công' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'O' as [MessageID],N'EN' as [Language],N'O' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'O' as [MessageID],N'VN' as [Language],N'O' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT1' as [MessageID],N'EN' as [Language],N'OT1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT1' as [MessageID],N'VN' as [Language],N'OT1 tính lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT2a' as [MessageID],N'EN' as [Language],N'OT2a' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT2a' as [MessageID],N'VN' as [Language],N'OT2a' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT3' as [MessageID],N'EN' as [Language],N'OT3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT3' as [MessageID],N'VN' as [Language],N'OT3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT4' as [MessageID],N'EN' as [Language],N'OT4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT4' as [MessageID],N'VN' as [Language],N'OT4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT5' as [MessageID],N'EN' as [Language],N'OT5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'OT5' as [MessageID],N'VN' as [Language],N'OT5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'P' as [MessageID],N'EN' as [Language],N'P' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'P' as [MessageID],N'VN' as [Language],N'P' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'PaidLeaveHrs' as [MessageID],N'EN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'PaidLeaveHrs' as [MessageID],N'VN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'plgfwcommand' as [MessageID],N'CN' as [Language],N'影片播放清单' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'plgfwcommand' as [MessageID],N'EN' as [Language],N'Resident address' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'plgfwcommand' as [MessageID],N'KR' as [Language],N'Resident address' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'plgFWCommand' as [MessageID],N'VN' as [Language],N'Chức năng toàn bộ máy chấm công' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'PositionName' as [MessageID],N'CN' as [Language],N'职位名称' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'PositionName' as [MessageID],N'EN' as [Language],N'Position name' as [Content],N'242' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'PositionName' as [MessageID],N'VN' as [Language],N'Chức danh' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ProbationEndDate' as [MessageID],N'CN' as [Language],N'试用期结束日期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ProbationEndDate' as [MessageID],N'EN' as [Language],N'Probation end date' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'ProbationEndDate' as [MessageID],N'VN' as [Language],N'Ngày kết thúc thử việc' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'Root' as [MessageID],N'CN' as [Language],N'根目錄' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'Root' as [MessageID],N'EN' as [Language],N'Root' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'Root' as [MessageID],N'KR' as [Language],N'Resident address' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'Root' as [MessageID],N'VN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'S' as [MessageID],N'EN' as [Language],N'S' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'S' as [MessageID],N'VN' as [Language],N'S' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'S2' as [MessageID],N'EN' as [Language],N'S2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'S2' as [MessageID],N'VN' as [Language],N'S2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10Att' as [MessageID],N'EN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10Att' as [MessageID],N'VN' as [Language],N'10' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10In' as [MessageID],N'CN' as [Language],N'[10]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.10Out' as [MessageID],N'CN' as [Language],N'[10]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11Att' as [MessageID],N'EN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11Att' as [MessageID],N'VN' as [Language],N'11' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11In' as [MessageID],N'CN' as [Language],N'[11]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.11Out' as [MessageID],N'CN' as [Language],N'[11]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12Att' as [MessageID],N'EN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12Att' as [MessageID],N'VN' as [Language],N'12' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12In' as [MessageID],N'CN' as [Language],N'[12]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.12Out' as [MessageID],N'CN' as [Language],N'[12]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13Att' as [MessageID],N'EN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13Att' as [MessageID],N'VN' as [Language],N'13' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13In' as [MessageID],N'CN' as [Language],N'[13]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.13Out' as [MessageID],N'CN' as [Language],N'[13]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14Att' as [MessageID],N'EN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14Att' as [MessageID],N'VN' as [Language],N'14' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14In' as [MessageID],N'CN' as [Language],N'[14]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.14Out' as [MessageID],N'CN' as [Language],N'[14]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15Att' as [MessageID],N'EN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15Att' as [MessageID],N'VN' as [Language],N'15' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15In' as [MessageID],N'CN' as [Language],N'[15]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.15Out' as [MessageID],N'CN' as [Language],N'[15]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'CN' as [Language],N'十六' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'EN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Att' as [MessageID],N'VN' as [Language],N'16' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16In' as [MessageID],N'CN' as [Language],N'[16]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.16Out' as [MessageID],N'CN' as [Language],N'[16]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'CN' as [Language],N'十七' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'EN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Att' as [MessageID],N'VN' as [Language],N'17' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17In' as [MessageID],N'CN' as [Language],N'[17]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.17Out' as [MessageID],N'CN' as [Language],N'[17]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'CN' as [Language],N'十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'EN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Att' as [MessageID],N'VN' as [Language],N'18' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18In' as [MessageID],N'CN' as [Language],N'[18]已进入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.18Out' as [MessageID],N'CN' as [Language],N'[18]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'CN' as [Language],N'十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'EN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Att' as [MessageID],N'VN' as [Language],N'19' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19In' as [MessageID],N'CN' as [Language],N'[19]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.19Out' as [MessageID],N'CN' as [Language],N'[19]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'CN' as [Language],N'工作时间' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'EN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Att' as [MessageID],N'VN' as [Language],N'1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1In' as [MessageID],N'CN' as [Language],N'在' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1In' as [MessageID],N'EN' as [Language],N'In' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1In' as [MessageID],N'VN' as [Language],N'Máy vào' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Out' as [MessageID],N'CN' as [Language],N'[1]出' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Out' as [MessageID],N'EN' as [Language],N'Out' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.1Out' as [MessageID],N'VN' as [Language],N'Ra' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'CN' as [Language],N'二十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'EN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Att' as [MessageID],N'VN' as [Language],N'20' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20In' as [MessageID],N'CN' as [Language],N'[20]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.20Out' as [MessageID],N'CN' as [Language],N'[20]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'CN' as [Language],N'二十一' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'EN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Att' as [MessageID],N'VN' as [Language],N'21' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21In' as [MessageID],N'CN' as [Language],N'[21]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.21Out' as [MessageID],N'CN' as [Language],N'[21]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'CN' as [Language],N'二十二' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'EN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Att' as [MessageID],N'VN' as [Language],N'22' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22In' as [MessageID],N'CN' as [Language],N'[22]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.22Out' as [MessageID],N'CN' as [Language],N'[22]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'CN' as [Language],N'二十三' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'EN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Att' as [MessageID],N'VN' as [Language],N'23' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23In' as [MessageID],N'CN' as [Language],N'[23]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.23Out' as [MessageID],N'CN' as [Language],N'[23]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'CN' as [Language],N'二十四' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'EN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Att' as [MessageID],N'VN' as [Language],N'24' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24In' as [MessageID],N'CN' as [Language],N'[24]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.24Out' as [MessageID],N'CN' as [Language],N'[24]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'CN' as [Language],N'二十五' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'EN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Att' as [MessageID],N'VN' as [Language],N'25' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25In' as [MessageID],N'CN' as [Language],N'[25]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.25Out' as [MessageID],N'CN' as [Language],N'[25]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'CN' as [Language],N'二十六' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'EN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Att' as [MessageID],N'VN' as [Language],N'26' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26In' as [MessageID],N'CN' as [Language],N'[26]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.26Out' as [MessageID],N'CN' as [Language],N'[26]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'CN' as [Language],N'二十七' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'EN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Att' as [MessageID],N'VN' as [Language],N'27' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27In' as [MessageID],N'CN' as [Language],N'[27]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.27Out' as [MessageID],N'CN' as [Language],N'[27]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'CN' as [Language],N'二十八' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'EN' as [Language],N'28' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Att' as [MessageID],N'VN' as [Language],N'28' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28In' as [MessageID],N'CN' as [Language],N'[28]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.28Out' as [MessageID],N'CN' as [Language],N'[28]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'CN' as [Language],N'二十九' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'EN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Att' as [MessageID],N'VN' as [Language],N'29' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29In' as [MessageID],N'CN' as [Language],N'[29]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.29Out' as [MessageID],N'CN' as [Language],N'[29]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2Att' as [MessageID],N'EN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2Att' as [MessageID],N'VN' as [Language],N'2' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2In' as [MessageID],N'CN' as [Language],N'[2]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.2Out' as [MessageID],N'CN' as [Language],N'[2]出' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'CN' as [Language],N'三十' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'EN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Att' as [MessageID],N'VN' as [Language],N'30' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30In' as [MessageID],N'CN' as [Language],N'[30]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.30Out' as [MessageID],N'CN' as [Language],N'[30]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31Att' as [MessageID],N'EN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31Att' as [MessageID],N'VN' as [Language],N'31' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31In' as [MessageID],N'CN' as [Language],N'[31]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.31Out' as [MessageID],N'CN' as [Language],N'[31]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3Att' as [MessageID],N'EN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3Att' as [MessageID],N'VN' as [Language],N'3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3In' as [MessageID],N'CN' as [Language],N'[3]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.3Out' as [MessageID],N'CN' as [Language],N'[3]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4Att' as [MessageID],N'EN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4Att' as [MessageID],N'VN' as [Language],N'4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4In' as [MessageID],N'CN' as [Language],N'[4]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.4Out' as [MessageID],N'CN' as [Language],N'[4]出' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5Att' as [MessageID],N'EN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5Att' as [MessageID],N'VN' as [Language],N'5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5In' as [MessageID],N'CN' as [Language],N'[5]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.5Out' as [MessageID],N'CN' as [Language],N'[5]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6Att' as [MessageID],N'EN' as [Language],N'6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6Att' as [MessageID],N'VN' as [Language],N'6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6In' as [MessageID],N'CN' as [Language],N'[6]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.6Out' as [MessageID],N'CN' as [Language],N'[6]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7Att' as [MessageID],N'EN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7Att' as [MessageID],N'VN' as [Language],N'7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7In' as [MessageID],N'CN' as [Language],N'[7]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.7Out' as [MessageID],N'CN' as [Language],N'[7]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8Att' as [MessageID],N'EN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8Att' as [MessageID],N'VN' as [Language],N'8' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8In' as [MessageID],N'CN' as [Language],N'[8]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.8Out' as [MessageID],N'CN' as [Language],N'[8]出' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9Att' as [MessageID],N'EN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9Att' as [MessageID],N'VN' as [Language],N'9' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9In' as [MessageID],N'CN' as [Language],N'[9]输入' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.9Out' as [MessageID],N'CN' as [Language],N'[9]外' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.Actual_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công thực tế' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.AL' as [MessageID],N'CN' as [Language],N'海军陆战队' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.AttDays' as [MessageID],N'CN' as [Language],N'平日' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.AttDays' as [MessageID],N'VN' as [Language],N'Ngày thường' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.ATTHours' as [MessageID],N'CN' as [Language],N'总工作时间' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.ATTHours' as [MessageID],N'EN' as [Language],N'Total Hour' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.ATTHours' as [MessageID],N'VN' as [Language],N'Tổng giờ công' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_9' as [MessageID],N'EN' as [Language],N'9:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_EmployeeTypeID' as [MessageID],N'CN' as [Language],N'影片播放清单' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_EmployeeTypeID' as [MessageID],N'EN' as [Language],N'Resident address' as [Content],N'86' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_EmployeeTypeID' as [MessageID],N'VN' as [Language],N'Địa chỉ thường trú' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_K' as [MessageID],N'CN' as [Language],N'K：缺少' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_K' as [MessageID],N'EN' as [Language],N'K: Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_K' as [MessageID],N'VN' as [Language],N'K:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSCount' as [MessageID],N'CN' as [Language],N'夜津贴' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSCount' as [MessageID],N'EN' as [Language],N'Night allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSCount' as [MessageID],N'VN' as [Language],N'Phụ cấp đêm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSHour' as [MessageID],N'CN' as [Language],N'NSHour：缺少' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSHour' as [MessageID],N'EN' as [Language],N'NSHour: Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_NSHour' as [MessageID],N'VN' as [Language],N'NSHour:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT22' as [MessageID],N'CN' as [Language],N'OT22：缺少' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT22' as [MessageID],N'EN' as [Language],N'OT22: Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT22' as [MessageID],N'VN' as [Language],N'OT22:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT23' as [MessageID],N'CN' as [Language],N'OT23：缺少' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT23' as [MessageID],N'EN' as [Language],N'OT23: Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT23' as [MessageID],N'VN' as [Language],N'OT23:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT26' as [MessageID],N'CN' as [Language],N'夜津贴' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT26' as [MessageID],N'EN' as [Language],N'Night allowance' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT26' as [MessageID],N'VN' as [Language],N'Phụ cấp đêm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT27' as [MessageID],N'CN' as [Language],N'随着时间的推移' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT27' as [MessageID],N'EN' as [Language],N'Overtime' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_OT27' as [MessageID],N'VN' as [Language],N'Tăng ca' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_SectionPriority' as [MessageID],N'EN' as [Language],N'SectionPriority:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_STT' as [MessageID],N'EN' as [Language],N'STT:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_WL' as [MessageID],N'EN' as [Language],N'WL:Missing' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_WPL' as [MessageID],N'CN' as [Language],N'休息日摘要' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_WPL' as [MessageID],N'EN' as [Language],N'Leave summary' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_WPL' as [MessageID],N'VN' as [Language],N'Thông tin nghỉ' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_xml' as [MessageID],N'CN' as [Language],N'合计' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_xml' as [MessageID],N'EN' as [Language],N'total' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.band_xml' as [MessageID],N'VN' as [Language],N'Tổng cộng' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.BDN' as [MessageID],N'CN' as [Language],N'BDN' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.cbx@DivisionID' as [MessageID],N'CN' as [Language],N'部門' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.ckb@FilterByDateRange' as [MessageID],N'EN' as [Language],N'Filter by date range' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.CO01' as [MessageID],N'CN' as [Language],N'CO01' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.CO02' as [MessageID],N'CN' as [Language],N'二氧化碳' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.Col1' as [MessageID],N'VN' as [Language],N'lblCol1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.DepartmentName' as [MessageID],N'VN' as [Language],N'Phòng ban' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.dtp@ToDate' as [MessageID],N'CN' as [Language],N'到' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.dtp@ToDate' as [MessageID],N'EN' as [Language],N'To' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.dtp@ToDate' as [MessageID],N'VN' as [Language],N'Làm thêm giờ dến khi' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_DataSetting.GeneralInfo' as [MessageID],N'VN' as [Language],N'Thông tin nhân viên員工資料' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.HireDate' as [MessageID],N'VN' as [Language],N'Ngày vào làm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.IOCount' as [MessageID],N'CN' as [Language],N'晚/早（次）' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.IOCount' as [MessageID],N'VN' as [Language],N'Số lần trễ/sớm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.IOHrs' as [MessageID],N'VN' as [Language],N'Trễ/
+sớm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.IOSum' as [MessageID],N'VN' as [Language],N'Số phút trễ, sớm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.item0' as [MessageID],N'VN' as [Language],N'item0' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.item1' as [MessageID],N'VN' as [Language],N'item1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.LateEarlySixMinute' as [MessageID],N'VN' as [Language],N'Trễ, sớm trên 6 phút (công)' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@divisionid' as [MessageID],N'CN' as [Language],N'部門' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@employeeid_param' as [MessageID],N'CN' as [Language],N'員工工號' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@filterbydaterange' as [MessageID],N'EN' as [Language],N'Filter by date range' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@filterbydaterange' as [MessageID],N'VN' as [Language],N'Xem dữ liệu theo khoảng thời gian' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@fromdate' as [MessageID],N'CN' as [Language],N'從' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@fromdate' as [MessageID],N'VN' as [Language],N'Từ ngày' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@optionview' as [MessageID],N'VN' as [Language],N'Chế độ xem' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@todate' as [MessageID],N'CN' as [Language],N'到' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@todate' as [MessageID],N'EN' as [Language],N'To' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lbl@todate' as [MessageID],N'VN' as [Language],N'Đến ngày' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.lblCol1' as [MessageID],N'VN' as [Language],N'lblCol1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NDS' as [MessageID],N'CN' as [Language],N'NDS' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSCount' as [MessageID],N'CN' as [Language],N'天數' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSCount' as [MessageID],N'EN' as [Language],N'Number of days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSCount' as [MessageID],N'VN' as [Language],N'Số ngày' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSHour' as [MessageID],N'CN' as [Language],N'那一刻' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSHour' as [MessageID],N'EN' as [Language],N'Time' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NSHour' as [MessageID],N'VN' as [Language],N'Số giờ' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.NVS' as [MessageID],N'CN' as [Language],N'NVS' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.Oil_AL' as [MessageID],N'VN' as [Language],N'PC xăng' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT1' as [MessageID],N'EN' as [Language],N'OT1' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT11' as [MessageID],N'VN' as [Language],N'TC 150%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT21' as [MessageID],N'VN' as [Language],N'Lễ 300%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT22' as [MessageID],N'VN' as [Language],N'TC Đêm 210%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.OT23' as [MessageID],N'CN' as [Language],N'CN 200％' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.OT23' as [MessageID],N'EN' as [Language],N'CN 200%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.OT23' as [MessageID],N'VN' as [Language],N'CN 200%' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT26' as [MessageID],N'VN' as [Language],N'CN 270%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT27' as [MessageID],N'VN' as [Language],N'Lễ đêm 390%' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT2a' as [MessageID],N'EN' as [Language],N'OT2a' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT2b' as [MessageID],N'EN' as [Language],N'OT2b' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT3' as [MessageID],N'EN' as [Language],N'OT3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT4' as [MessageID],N'EN' as [Language],N'OT4' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT5' as [MessageID],N'EN' as [Language],N'OT5' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT6' as [MessageID],N'EN' as [Language],N'OT6' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.OT7' as [MessageID],N'EN' as [Language],N'OT7' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeave' as [MessageID],N'EN' as [Language],N'Paid Leave Days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeaveHrs' as [MessageID],N'EN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeaveHrs' as [MessageID],N'VN' as [Language],N'Paid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.PaidLeaves' as [MessageID],N'CN' as [Language],N'带薪休假' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PaidLeaves' as [MessageID],N'VN' as [Language],N'Nghỉ hưởng lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PH' as [MessageID],N'VN' as [Language],N'PH' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.PL' as [MessageID],N'VN' as [Language],N'PL' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.plg_FWCommand' as [MessageID],N'VN' as [Language],N'plg_fwcommand:vn' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.PRG' as [MessageID],N'CN' as [Language],N'PRG' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.STD_WorkingDays' as [MessageID],N'CN' as [Language],N'標準工作天' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.STD_WorkingDays' as [MessageID],N'EN' as [Language],N'STD WKDs' as [Content],N'82' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.STD_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công chuẩn' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalDayOff' as [MessageID],N'CN' as [Language],N'休假' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalDayOff' as [MessageID],N'VN' as [Language],N'Ngày nghỉ' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalNS' as [MessageID],N'VN' as [Language],N'NS Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.TotalOT' as [MessageID],N'VN' as [Language],N'Tổng OT' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'CN' as [Language],N'公开工资' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'EN' as [Language],N'Total paid days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.TotalPaidDays' as [MessageID],N'VN' as [Language],N'Công hưởng lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.txt@OptionView' as [MessageID],N'VN' as [Language],N'Chế độ xem' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'CN' as [Language],N'无薪假期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'EN' as [Language],N'Unpaid Leave' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnpaidLeave' as [MessageID],N'VN' as [Language],N'Unpaid Leave Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_AttendanceSummaryMonthly_STD_Datasetting.UnPaidLeaves' as [MessageID],N'CN' as [Language],N'无薪假期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.UnPaidLeaves' as [MessageID],N'VN' as [Language],N'Nghỉ không lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.Workdays' as [MessageID],N'EN' as [Language],N'Working days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.WorkHours' as [MessageID],N'EN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'sp_attendancesummarymonthly_std_datasetting.WorkHours' as [MessageID],N'VN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'SP3' as [MessageID],N'EN' as [Language],N'SP3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'SP3' as [MessageID],N'VN' as [Language],N'SP3' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STD_WorkingDays' as [MessageID],N'CN' as [Language],N'標準工作天' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STD_WorkingDays' as [MessageID],N'EN' as [Language],N'Standard workday' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STD_WorkingDays' as [MessageID],N'VN' as [Language],N'Ngày công chuẩn' as [Content],N'100000' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STT' as [MessageID],N'CN' as [Language],N'不行' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STT' as [MessageID],N'EN' as [Language],N'No' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'STT' as [MessageID],N'VN' as [Language],N'STT' as [Content],N'1' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalDayOff' as [MessageID],N'CN' as [Language],N'休假' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalDayOff' as [MessageID],N'VN' as [Language],N'Ngày nghỉ' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalNS' as [MessageID],N'VN' as [Language],N'NS Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalOT' as [MessageID],N'EN' as [Language],N'Total OT' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalOT' as [MessageID],N'VN' as [Language],N'Tổng OT
+(Chưa quy đổi' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalPaidDays' as [MessageID],N'CN' as [Language],N'公开工资' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalPaidDays' as [MessageID],N'EN' as [Language],N'Total paid days' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'TotalPaidDays' as [MessageID],N'VN' as [Language],N'Công hưởng lương' as [Content],N'1' as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'txtFilter' as [MessageID],N'CN' as [Language],N'筛选条件' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'txtFilter' as [MessageID],N'EN' as [Language],N'Filter' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'txtFilter' as [MessageID],N'KR' as [Language],N'검색' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'txtFilter' as [MessageID],N'VN' as [Language],N'Tìm kiếm' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'UnpaidLeave' as [MessageID],N'CN' as [Language],N'无薪假期' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'UnpaidLeave' as [MessageID],N'EN' as [Language],N'Unpaid leave' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'UnpaidLeave' as [MessageID],N'VN' as [Language],N'Nghỉ không lương' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'WorkHours' as [MessageID],N'EN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending] UNION ALL
+
+Select  N'WorkHours' as [MessageID],N'VN' as [Language],N'Regular Hrs' as [Content],NULL as [Frequency],NULL as [IgnorePending]
+EXEC sp_SaveData  @TableNameTmp = '#tblMD_Message' , @TableName = 'tblMD_Message' , @Command = 'insert' , @IsDropTableTmp =0,@IsPrint=0IF OBJECT_ID('tempdb..#tblMD_Message') IS NOT NULL DROP TABLE #tblMD_Message
+--#endregion _
+GO
+
+--#region tblProcedureName
+IF OBJECT_ID('tempdb..#tblProcedureName') IS NOT NULL DROP TABLE #tblProcedureName
+  create table #tblProcedureName (
+   [ProcID] [int] NULL 
+ , [ObjectID] [int] NULL 
+ , [ProcName] [nvarchar](MAX) NULL 
+ , [TemplateName] [nvarchar](MAX) NULL 
+ , [Descriptions] [nvarchar](MAX) NULL 
+ , [AutoGen] [bit] NULL 
+ , [FixedParamter] [nvarchar](MAX) NULL 
+ , [StartRow] [int] NULL 
+ , [PreProcedureName] [nvarchar](MAX) NULL 
+ , [PostProcedureName] [nvarchar](MAX) NULL 
+ , [BlockImport] [bit] NULL 
+ , [DontAlterMissingColumn] [bit] NULL 
+ , [IsImportUsingEntireTable] [bit] NULL 
+ , [FollowThreeStepImport] [nvarchar](MAX) NULL 
+ , [PostCommand] [nvarchar](MAX) NULL 
+ , [IsFollowThreeStepImport] [bit] NULL 
+ , [AutoInsertUpdateToTable] [nvarchar](MAX) NULL 
+ , [ParamDefineRowPosition] [int] NULL 
+ , [TemplateBinary] varbinary(max) NULL 
+ , [TemplateBinary_FilenName] [nvarchar](MAX) NULL 
+ , [TemplateBinary_filename] [nvarchar](MAX) NULL 
+ , [ImportSheetName] [nvarchar](MAX) NULL 
+ , [DescriptionsEN] [nvarchar](MAX) NULL 
+ , [DescriptionsLA] [nvarchar](MAX) NULL 
+ , [IsImportAllSheet] [bit] NULL 
+ , [FolderFilesCount] [int] NULL 
+ , [TypeImport] [int] NULL 
+ , [TypeImportRow] [int] NULL 
+)
+
+ INSERT INTO #tblProcedureName([ProcID],[ObjectID],[ProcName],[TemplateName],[Descriptions],[AutoGen],[FixedParamter],[StartRow],[PreProcedureName],[PostProcedureName],[BlockImport],[DontAlterMissingColumn],[IsImportUsingEntireTable],[FollowThreeStepImport],[PostCommand],[IsFollowThreeStepImport],[AutoInsertUpdateToTable],[ParamDefineRowPosition],[TemplateBinary],[TemplateBinary_FilenName],[TemplateBinary_filename],[ImportSheetName],[DescriptionsEN],[DescriptionsLA],[IsImportAllSheet],[FolderFilesCount],[TypeImport],[TypeImportRow])
+Select  N'145' as [ProcID],N'501' as [ObjectID],N'ImportTimeSheet' as [ProcName],N'ImportAttendanceSheetToRawData' as [TemplateName],N'Nhập dữ liệu chấm công, timesheet' as [Descriptions],N'False' as [AutoGen],NULL as [FixedParamter],N'10' as [StartRow],NULL as [PreProcedureName],NULL as [PostProcedureName],NULL as [BlockImport],NULL as [DontAlterMissingColumn],N'True' as [IsImportUsingEntireTable],N'Template_ImportTimeSheet' as [FollowThreeStepImport],NULL as [PostCommand],N'True' as [IsFollowThreeStepImport],NULL as [AutoInsertUpdateToTable],NULL as [ParamDefineRowPosition],NULL as [TemplateBinary],NULL as [TemplateBinary_FilenName],NULL as [TemplateBinary_filename],NULL as [ImportSheetName],N'Import Timekeeping data, timesheet' as [DescriptionsEN],NULL as [DescriptionsLA],NULL as [IsImportAllSheet],NULL as [FolderFilesCount],NULL as [TypeImport],NULL as [TypeImportRow]
+
+EXEC sp_SaveData  @TableNameTmp = '#tblProcedureName' , @TableName = 'tblProcedureName' , @Command = 'DeleteNot',@ColumnDeleteNot='TemplateName' , @IsDropTableTmp =0,@IsPrint=0
+EXEC sp_SaveData  @TableNameTmp = '#tblProcedureName' , @TableName = 'tblProcedureName' , @Command = 'insert,update' , @IsDropTableTmp =0,@IsPrint=0
+IF OBJECT_ID('tempdb..#tblProcedureName') IS NOT NULL DROP TABLE #tblProcedureName
+--#endregion _
+
+
